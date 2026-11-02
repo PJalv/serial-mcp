@@ -18,7 +18,7 @@ tokio = { version = "=1.54.1", features = ["macros", "rt", "io-std"] }
 serde_json = "=1.0.149"
 libc = "=0.2.183"
 crossterm = "=0.29.0"
-ratatui = "=0.30.0"
+ratatui = { version = "=0.30.0", features = ["unstable-rendered-line-info"] }
 vt100 = "=0.16.2"
 base64 = "=0.22.1"
 

@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color as TColor, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Terminal,
 };
 use serde_json::{json, Value};
@@ -511,11 +511,42 @@ fn run() -> Result<(), String> {
             } else {
                 28
             };
-            let visible_devices = term_height.saturating_sub(4).max(1) as usize;
+            let prompt_header = if baud_confirm {
+                let candidates = [
+                    format!(" serial-mcp · MCP clients: {count}\n Shared baud affects all clients. Confirm y/n"),
+                    format!("MCP{count}\nShared baud affects all\nConfirm y/n"),
+                    "Shared baud? y/n".to_owned(),
+                    "y/n".to_owned(),
+                ];
+                Some(fitting_prompt(&candidates, term_width, term_height))
+            } else {
+                baud_prompt.as_ref().map(|baud| {
+                    let candidates = [
+                        format!(" serial-mcp · MCP clients: {count}\n Baud rate 1–4000000: {baud} · Enter confirms · Esc cancels"),
+                        format!("MCP{count}\nBaud:{baud}\nRange 1-4000000\nEnter=apply\nEsc=cancel"),
+                        format!("Baud:{baud}\n1-4000000\nEnter apply/Esc cancel"),
+                        format!("Baud {baud} Enter apply/Esc cancel"),
+                        format!("E/Esc {baud}"),
+                    ];
+                    fitting_prompt(&candidates, term_width, term_height)
+                })
+            };
+            let header_height = prompt_header
+                .as_ref()
+                .map(|header| prompt_header_height(header, term_width, term_height))
+                .unwrap_or(2);
+            let pane_content_top = header_height.saturating_add(1);
+            let screen_rows = term_height.saturating_sub(4).max(1);
+            let pane_height = term_height
+                .saturating_sub(header_height)
+                .saturating_sub(2)
+                .min(screen_rows);
+            let visible_devices = pane_height as usize;
+            let screen_row_offset = screen_rows.saturating_sub(pane_height);
             let sidebar_offset = selected.saturating_add(1).saturating_sub(visible_devices);
             for device in &mut devs {
                 device.screen.screen_mut().set_size(
-                    term_height.saturating_sub(4).max(1),
+                    screen_rows,
                     term_width
                         .saturating_sub(sidebar_width)
                         .saturating_sub(2)
@@ -526,7 +557,7 @@ fn run() -> Result<(), String> {
                 let size = f.area();
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(2), Constraint::Min(3)])
+                    .constraints([Constraint::Length(header_height), Constraint::Min(0)])
                     .split(size);
                 let status_device = active.or_else(|| {
                     if devs.is_empty() {
@@ -550,16 +581,22 @@ fn run() -> Result<(), String> {
                         )
                     })
                     .unwrap_or_default();
-                let header=if baud_confirm {
-                    format!(" serial-mcp · MCP clients: {count}\n Shared baud affects all participants; may disrupt AI work. Confirm y/n")
-                } else if let Some(b)=&baud_prompt {
-                    format!(" serial-mcp · MCP clients: {count}\n Baud rate 1–4000000: {b} · Enter confirms · Esc cancels")
-                } else {format!(" serial-mcp · MCP clients: {count}    {}    {}",status,device_status)};
-                f.render_widget(
-                    Paragraph::new(header)
-                    .block(Block::default().borders(Borders::BOTTOM)),
-                    rows[0],
-                );
+                let is_prompt = prompt_header.is_some();
+                let header = prompt_header.unwrap_or_else(|| {
+                    format!(
+                        " serial-mcp · MCP clients: {count}    {}    {}",
+                        status, device_status
+                    )
+                });
+                let header = Paragraph::new(header).wrap(Wrap { trim: true });
+                if is_prompt {
+                    f.render_widget(header, rows[0]);
+                } else {
+                    f.render_widget(
+                        header.block(Block::default().borders(Borders::BOTTOM)),
+                        rows[0],
+                    );
+                }
                 let cols = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Length(sidebar_width), Constraint::Min(0)])
@@ -597,8 +634,10 @@ fn run() -> Result<(), String> {
                 let lines = active
                     .map(|i| {
                         let screen = devs[i].screen.screen();
-                        (0..screen.size().0)
-                            .map(|r| {
+                        let row_offset = screen.size().0.saturating_sub(pane_height);
+                        (0..screen.size().0.min(pane_height))
+                            .map(|visible_row| {
+                                let r = visible_row.saturating_add(row_offset);
                                 let spans = (0..screen.size().1)
                                     .filter_map(|c| {
                                         let cell = screen.cell(r, c)?;
@@ -647,25 +686,32 @@ fn run() -> Result<(), String> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_else(|| vec![Line::from("Choose a device · Enter joins · q quits")]);
-                f.render_widget(
-                    Paragraph::new(lines).block(
-                        Block::default()
-                            .title(if active.is_some() {
-                                " Terminal · Esc Disconnect · Ctrl-B Change baud · Ctrl-End Bottom "
-                            } else {
-                                " Serial terminal "
-                            })
-                            .borders(Borders::ALL),
-                    ),
-                    cols[1],
-                );
+                if pane_height > 0 {
+                    f.render_widget(
+                        Paragraph::new(lines).block(
+                            Block::default()
+                                .title(if active.is_some() {
+                                    " Terminal · Esc Disconnect · Ctrl-B Change baud · Ctrl-End Bottom "
+                                } else {
+                                    " Serial terminal "
+                                })
+                                .borders(Borders::ALL),
+                        ),
+                        cols[1],
+                    );
+                }
                 if let Some(i) = active {
                     let screen = devs[i].screen.screen();
-                    if !screen.hide_cursor() && screen.scrollback() == 0 {
+                    let row_offset = screen.size().0.saturating_sub(pane_height);
+                    if pane_height > 0
+                        && !screen.hide_cursor()
+                        && screen.scrollback() == 0
+                        && screen.cursor_position().0 >= row_offset
+                    {
                         let (y, x) = screen.cursor_position();
                         f.set_cursor_position((
                             cols[1].x.saturating_add(1 + x),
-                            cols[1].y.saturating_add(1 + y),
+                            cols[1].y.saturating_add(1 + y - row_offset),
                         ));
                     }
                 }
@@ -688,6 +734,8 @@ fn run() -> Result<(), String> {
                     Event::Key(k)
                         if ((k.code == KeyCode::Char(']')
                             && k.modifiers.contains(KeyModifiers::CONTROL))
+                            || (k.code == KeyCode::Char('5')
+                                && k.modifiers.contains(KeyModifiers::CONTROL))
                             || k.code == KeyCode::Char('\x1d'))
                             && !literal_next =>
                     {
@@ -836,24 +884,28 @@ fn run() -> Result<(), String> {
                             }
                         }
                     }
-                    Event::Mouse(m) if active.is_some() && m.column>=sidebar_width && m.row>=3 && m.row<term_height.saturating_sub(1) && !m.modifiers.contains(KeyModifiers::SHIFT) && active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()!=vt100::MouseProtocolMode::None) => {
+                    Event::Mouse(m) if active.is_some() && pane_height > 0 && m.column>=sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) && !m.modifiers.contains(KeyModifiers::SHIFT) && active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()!=vt100::MouseProtocolMode::None) => {
                         if let Some(i)=active {
                             let screen=devs[i].screen.screen();
                             let col=m.column.saturating_sub(sidebar_width).max(1);
-                            let row=m.row.saturating_sub(2).max(1);
+                            let row = m
+                                .row
+                                .saturating_sub(header_height)
+                                .saturating_add(screen_row_offset)
+                                .max(1);
                             if let Some(bytes)=encode_mouse(screen.mouse_protocol_mode(),screen.mouse_protocol_encoding(),m.kind,m.modifiers,col,row) {
                                 if let Err(e)=c.req(json!({"op":"input","port":devs[i].port,"data":base64_encode(&bytes)})){status=format!("Mouse input outcome unknown: {e}; not replayed");}
                             }
                         }
                     }
-                    Event::Mouse(m) if active.is_some() && (m.modifiers.contains(KeyModifiers::SHIFT) || active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()==vt100::MouseProtocolMode::None)) && m.kind==MouseEventKind::Down(crossterm::event::MouseButton::Left) && m.column>=sidebar_width && m.row>=3 && m.row<term_height.saturating_sub(1) => {
-                        if let Some(i)=active { let pos=(m.row.saturating_sub(3),m.column.saturating_sub(sidebar_width+1)); devs[i].selection=Some((pos,pos)); devs[i].selecting=true; }
+                    Event::Mouse(m) if active.is_some() && pane_height > 0 && (m.modifiers.contains(KeyModifiers::SHIFT) || active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()==vt100::MouseProtocolMode::None)) && m.kind==MouseEventKind::Down(crossterm::event::MouseButton::Left) && m.column>=sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) => {
+                        if let Some(i)=active { let pos=(m.row.saturating_sub(pane_content_top).saturating_add(screen_row_offset),m.column.saturating_sub(sidebar_width+1)); devs[i].selection=Some((pos,pos)); devs[i].selecting=true; }
                     }
-                    Event::Mouse(m) if active.is_some() && (m.modifiers.contains(KeyModifiers::SHIFT) || active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()==vt100::MouseProtocolMode::None)) && m.kind==MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                        if let Some(i)=active { if devs[i].selecting { if let Some((start,_))=devs[i].selection {let pos=(m.row.saturating_sub(3),m.column.saturating_sub(sidebar_width+1));devs[i].selection=Some((start,pos));} } }
+                    Event::Mouse(m) if active.is_some() && pane_height > 0 && (m.modifiers.contains(KeyModifiers::SHIFT) || active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()==vt100::MouseProtocolMode::None)) && m.kind==MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                        if let Some(i)=active { if devs[i].selecting { if let Some((start,_))=devs[i].selection {let pos=(m.row.saturating_sub(pane_content_top).saturating_add(screen_row_offset),m.column.saturating_sub(sidebar_width+1));devs[i].selection=Some((start,pos));} } }
                     }
                     Event::Mouse(m) if active.is_some() && m.kind==MouseEventKind::Up(crossterm::event::MouseButton::Left) => {if let Some(i)=active{devs[i].selecting=false;}}
-                    Event::Mouse(m) if active.is_some() && m.column>=sidebar_width && m.kind == MouseEventKind::ScrollUp => {
+                    Event::Mouse(m) if active.is_some() && pane_height > 0 && m.column>=sidebar_width && m.kind == MouseEventKind::ScrollUp => {
                         if let Some(i) = active {
                             let s = devs[i].screen.screen_mut();
                             let n = s.scrollback();
@@ -861,7 +913,7 @@ fn run() -> Result<(), String> {
                             devs[i].new_output = true;
                         }
                     }
-                    Event::Mouse(m) if active.is_some() && m.column>=sidebar_width && m.kind == MouseEventKind::ScrollDown => {
+                    Event::Mouse(m) if active.is_some() && pane_height > 0 && m.column>=sidebar_width && m.kind == MouseEventKind::ScrollDown => {
                         if let Some(i) = active {
                             let s = devs[i].screen.screen_mut();
                             let n = s.scrollback();
@@ -874,14 +926,14 @@ fn run() -> Result<(), String> {
                     Event::Mouse(m)
                         if m.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left) =>
                     {
-                        if m.column < sidebar_width && m.row>=3 && m.row<term_height.saturating_sub(1) {
+                        if pane_height > 0 && m.column < sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) {
                             if let Some(i) = active.take() {
                                 let _ = c.req(json!({"op":"unsubscribe","port":devs[i].port}));
                                 let _ = c.req(json!({"op":"leave","port":devs[i].port}));
                                 devs[i].joined = false;
                                 devs[i].gap = true;
                             }
-                            selected = sidebar_offset.saturating_add((m.row as usize).saturating_sub(3)).min(devs.len().saturating_sub(1));
+                            selected = sidebar_offset.saturating_add((m.row as usize).saturating_sub(pane_content_top as usize)).min(devs.len().saturating_sub(1));
                             status = "Device selected · Enter joins".into();
                         }
                     }
@@ -1125,6 +1177,31 @@ fn encode_mouse(
     }
     Some(out)
 }
+fn wrapped_rows(text: &str, width: u16) -> u16 {
+    Paragraph::new(text)
+        .wrap(Wrap { trim: true })
+        .line_count(width.max(1))
+        .min(usize::from(u16::MAX)) as u16
+}
+
+fn prompt_header_height(text: &str, width: u16, height: u16) -> u16 {
+    wrapped_rows(text, width).min(height.max(1))
+}
+
+fn fitting_prompt(candidates: &[String], width: u16, height: u16) -> String {
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| wrapped_rows(candidate, width) <= height)
+    {
+        return candidate.clone();
+    }
+    candidates
+        .iter()
+        .min_by_key(|candidate| candidate.chars().count())
+        .map(|candidate| candidate.chars().take(width.max(1) as usize).collect())
+        .unwrap_or_default()
+}
+
 fn to_color(color: vt100::Color) -> TColor {
     match color {
         vt100::Color::Default => TColor::Reset,
@@ -1156,6 +1233,7 @@ fn route_pane_key(
     } else if literal_next
         && (key.code == KeyCode::Char(']')
             || key.code == KeyCode::Char('\x1d')
+            || (key.code == KeyCode::Char('5') && key.modifiers.contains(KeyModifiers::CONTROL))
             || key.code == KeyCode::Esc)
     {
         PaneKeyRoute::Send(if key.code == KeyCode::Esc {
@@ -1308,6 +1386,7 @@ mod tests {
         let plain_end = crossterm::event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
         let ctrl_end = crossterm::event::KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
         let ctrl_v = crossterm::event::KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let ctrl_five = crossterm::event::KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL);
         assert!(matches!(
             route_pane_key(plain_end, false, false),
             PaneKeyRoute::Send(bytes) if bytes == b"\x1b[F"
@@ -1328,6 +1407,84 @@ mod tests {
             route_pane_key(ctrl_end, true, false),
             PaneKeyRoute::Send(bytes) if bytes == b"\x1b[F"
         ));
+        assert!(matches!(
+            route_pane_key(ctrl_five, true, false),
+            PaneKeyRoute::Send(bytes) if bytes == b"\x1d"
+        ));
+    }
+
+    #[test]
+    fn baud_prompt_can_use_every_row_without_reserving_a_pane() {
+        let area = ratatui::layout::Rect::new(0, 0, 18, 5);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Min(0)])
+            .split(area);
+        assert_eq!(rows[0].height, 5);
+        assert_eq!(rows[1].height, 0);
+        let vt_rows = 1u16;
+        let pane_rows = 2u16.min(vt_rows);
+        assert_eq!(pane_rows, vt_rows);
+    }
+
+    #[test]
+    fn baud_prompt_header_reserves_rows_for_wrapped_text() {
+        let confirmation =
+            " serial-mcp · MCP clients: 1\n Shared baud affects all clients. Confirm y/n";
+        let prompt = " serial-mcp · MCP clients: 1\n Baud rate 1–4000000: 4000000 · Enter confirms · Esc cancels";
+        let empty_prompt =
+            " serial-mcp · MCP clients: 1\n Baud rate 1–4000000:  · Enter confirms · Esc cancels";
+        let compact_confirmation = "MCP1\nShared baud affects all\nConfirm y/n";
+        let compact_prompt = "MCP1\nBaud:4000000\nRange 1-4000000\nEnter=apply\nEsc=cancel";
+        let tiny_confirmation = "Shared baud? y/n";
+        let tiny_prompt = "Baud 4000000 Enter apply/Esc cancel";
+        let minimum_prompt = "E/Esc 4000000";
+        let minimum_confirmation = "y/n";
+        let short_prompt = "Baud:4000000\n1-4000000\nEnter apply/Esc cancel";
+        let confirmation_candidates = vec![
+            confirmation.to_owned(),
+            "MCP1\nShared baud affects all\nConfirm y/n".to_owned(),
+            tiny_confirmation.to_owned(),
+            minimum_confirmation.to_owned(),
+        ];
+        let baud_candidates = vec![
+            prompt.to_owned(),
+            compact_prompt.to_owned(),
+            short_prompt.to_owned(),
+            tiny_prompt.to_owned(),
+            minimum_prompt.to_owned(),
+        ];
+        assert_eq!(wrapped_rows(confirmation, 50), 2);
+        assert_eq!(wrapped_rows(confirmation, 24), 4);
+        assert_eq!(wrapped_rows(confirmation, 18), 6);
+        assert_eq!(wrapped_rows(prompt, 50), 3);
+        assert_eq!(wrapped_rows(prompt, 24), 5);
+        assert_eq!(wrapped_rows(prompt, 20), 6);
+        assert_eq!(wrapped_rows(prompt, 17), 7);
+        assert_eq!(wrapped_rows(empty_prompt, 51), 3);
+        assert_eq!(prompt_header_height(compact_confirmation, 18, 8), 4);
+        assert_eq!(prompt_header_height(compact_prompt, 18, 8), 5);
+        assert_eq!(prompt_header_height(compact_prompt, 18, 7), 5);
+        assert_eq!(prompt_header_height(compact_prompt, 18, 6), 5);
+        assert_eq!(prompt_header_height(compact_prompt, 18, 5), 5);
+        assert_eq!(prompt_header_height(compact_confirmation, 18, 3), 3);
+        assert_eq!(prompt_header_height(tiny_confirmation, 18, 3), 1);
+        assert_eq!(wrapped_rows(tiny_prompt, 18), 2);
+        assert_eq!(wrapped_rows(short_prompt, 18), 4);
+        assert_eq!(prompt_header_height(short_prompt, 18, 4), 4);
+        assert_eq!(fitting_prompt(&baud_candidates, 24, 4), short_prompt);
+        assert_eq!(
+            fitting_prompt(&confirmation_candidates, 10, 4),
+            tiny_confirmation
+        );
+        assert!(wrapped_rows(&fitting_prompt(&baud_candidates, 10, 4), 10) <= 4);
+        assert_eq!(
+            fitting_prompt(&confirmation_candidates, 10, 1),
+            minimum_confirmation
+        );
+        assert!(wrapped_rows(&fitting_prompt(&confirmation_candidates, 10, 1), 10) <= 1);
+        assert!(!fitting_prompt(&baud_candidates, 10, 1).is_empty());
+        assert_eq!(prompt_header_height(confirmation, 18, 1), 1);
     }
 
     #[test]
