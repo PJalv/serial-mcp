@@ -81,6 +81,18 @@ def _read_until(fd, buf, needle, timeout=5, start=0):
     assert needle in _visible(buf[start:]), _visible(buf[-2000:])
 
 
+def _read_raw_until(fd, buf, needle, timeout=5, start=0):
+    deadline = time.monotonic() + timeout
+    while needle not in buf[start:] and time.monotonic() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if readable:
+            try:
+                buf.extend(os.read(fd, 8192))
+            except OSError:
+                break
+    assert needle in buf[start:], repr(buf[-2000:])
+
+
 def test_rust_terminal_counts_mcp_and_quits_cleanly_in_isolated_daemon(tmp_path,terminal_binary):
     runtime = tmp_path / "runtime"
     runtime.mkdir(mode=0o700)
@@ -88,15 +100,15 @@ def test_rust_terminal_counts_mcp_and_quits_cleanly_in_isolated_daemon(tmp_path,
         runtime, state=serial_mcp_engine.SerialState(log_path=str(tmp_path / "daemon.log"))
     )
     daemon.start()
+    mcp = ipc.DaemonClient.connect(runtime / "daemon.sock")
+    mcp.hello("mcp", "synthetic-idle-client")
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
     env = dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime))
     proc = subprocess.Popen([str(terminal_binary)], stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     output = bytearray()
-    mcp = ipc.DaemonClient.connect(runtime / "daemon.sock")
     try:
-        mcp.hello("mcp", "synthetic-idle-client")
         _read_until(master, output, b"MCPclients:1")
         os.write(master, b"q")
         proc.wait(timeout=5)
@@ -196,29 +208,43 @@ def test_rust_terminal_ctrl_bracket_returns_visible_focus_to_sidebar(tmp_path, m
     output = bytearray()
     observer = ipc.DaemonClient.connect(runtime / "daemon.sock")
     observer.hello("mcp", "ctrl-bracket-status-observer")
+    peer = ipc.DaemonClient.connect(runtime / "daemon.sock")
+    peer.hello("human", "synthetic-retained-member")
     try:
         _read_until(master, output, b"MCPclients:")
         _read_until(master, output, port.encode(), timeout=5)
         os.write(master, b"\r115200\r")
         _read_until(master, output, b"connected", timeout=8)
         assert observer.status()["devices"][0]["members"] == 1
+        assert peer.join(port)["joined"] is True
+        assert observer.status()["devices"][0]["members"] == 2
+
+        os.write(device_master, b"\x1b[?2004h\r\n" + b" " * 30 + b"CACHE_MARKER")
+        _read_until(master, output, b"CACHE_MARKER", timeout=5)
+        paste = b"\x1b[200~alpha\nbeta\x1b[201~"
+        os.write(master, paste)
+        paste_forwarded = bytearray()
+        _read_raw_until(device_master, paste_forwarded, paste, timeout=5)
+        assert paste_forwarded == paste
+        resize_at = len(output)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 50, 0, 0))
+        os.kill(proc.pid, signal.SIGWINCH)
+        _read_until(master, output, b"Terminal", start=resize_at)
 
         os.write(master, b"\x16")
-        _read_until(master, output, b"Next key sent literally", timeout=5)
+        _read_until(master, output, b"Next key sent", timeout=5)
         os.write(master, b"\x1d")
         readable, _, _ = select.select([device_master], [], [], 3)
         assert readable and os.read(device_master, 1) == b"\x1d"
-        assert observer.status()["devices"][0]["members"] == 1
+        assert observer.status()["devices"][0]["members"] == 2
         while select.select([device_master], [], [], 0)[0]:
             os.read(device_master, 4096)
 
         leave_at = len(output)
         os.write(master, b"\x1d")
-        _read_until(master, output, b"OUTPUT GAP", timeout=5, start=leave_at)
-        deadline = time.monotonic() + 3
-        while observer.status()["devices"] and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert observer.status()["devices"] == []
+        _read_until(master, output, b"GAP MCP", timeout=5, start=leave_at)
+        devices = observer.status()["devices"]
+        assert devices and devices[0]["members"] == 1
 
         os.write(master, b"\x1b[B")
         input_at = len(output)
@@ -227,15 +253,29 @@ def test_rust_terminal_ctrl_bracket_returns_visible_focus_to_sidebar(tmp_path, m
         try:
             forwarded = os.read(device_master, 4096) if readable else b""
         except OSError:
-            forwarded = b""  # The daemon closed its synthetic slave after leave.
+            forwarded = b""  # The synthetic peer may close during teardown.
         assert forwarded == b"", f"sidebar input reached serial PTY: {forwarded!r}"
         assert b"Z" not in _visible(output[input_at:])
+
+        os.write(master, b"\r")
+        deadline = time.monotonic() + 3
+        devices = []
+        while time.monotonic() < deadline:
+            devices = observer.status()["devices"]
+            if devices and devices[0]["members"] == 2:
+                break
+            time.sleep(0.01)
+        assert devices and devices[0]["members"] == 2
+        rejoin_at = len(output)
+        os.write(device_master, b"\r\nCACHE_AFTER_REJOIN")
+        _read_until(master, output, b"CACHE_AFTER_REJOIN", start=rejoin_at)
 
     finally:
         if proc.poll() is None:
             proc.terminate()
             proc.wait(timeout=5)
         observer.close()
+        peer.close()
         daemon.stop("test complete")
         os.close(master)
         os.close(device_master)
@@ -281,6 +321,15 @@ def test_rust_terminal_shared_baud_prompts_are_visible(tmp_path, monkeypatch, te
         _read_until(master, output, b"Confirm", start=confirm_at)
         _read_until(master, output, b"y/n", start=confirm_at)
 
+        os.write(master, b"\x1b[200~y9600\r\x1b[201~")
+        os.write(master, b"n")
+        assert not select.select([device_master], [], [], 0)[0]
+        devices = observer.status()["devices"]
+        assert devices and devices[0]["baudrate"] == 115200
+
+        confirm_at = len(output)
+        os.write(master, b"\x02")
+        _read_until(master, output, b"Confirm", start=confirm_at)
         prompt_at = len(output)
         os.write(master, b"y")
         _read_until(master, output, b"Baud rate 1", start=prompt_at)
@@ -289,6 +338,32 @@ def test_rust_terminal_shared_baud_prompts_are_visible(tmp_path, monkeypatch, te
         os.write(master, b"9600\r")
         deadline = time.monotonic() + 5
         devices = []
+        while time.monotonic() < deadline:
+            devices = observer.status()["devices"]
+            if devices and devices[0]["baudrate"] == 9600:
+                break
+            time.sleep(0.01)
+        assert devices and devices[0]["baudrate"] == 9600
+
+        resize_at = len(output)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 1, 10, 0, 0))
+        os.kill(proc.pid, signal.SIGWINCH)
+        _read_raw_until(master, output, b"\x1b[1;1H", start=resize_at)
+        warning_at = len(output)
+        os.write(master, b"\x02")
+        _read_until(master, output, b"Resize", start=warning_at)
+        devices = observer.status()["devices"]
+        assert devices and devices[0]["baudrate"] == 9600
+
+        resize_at = len(output)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 50, 0, 0))
+        os.kill(proc.pid, signal.SIGWINCH)
+        _read_until(master, output, b"serial-mcp", start=resize_at)
+        confirm_at = len(output)
+        os.write(master, b"\x02")
+        _read_until(master, output, b"Confirm", start=confirm_at)
+        os.write(master, b"n")
+        deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             devices = observer.status()["devices"]
             if devices and devices[0]["baudrate"] == 9600:

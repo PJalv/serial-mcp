@@ -1,5 +1,8 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers, MouseEventKind},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,6 +19,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Read, Write},
+    net::Shutdown,
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, PermissionsExt},
         net::UnixStream,
@@ -98,6 +102,23 @@ impl Client {
             overflow: false,
         })
     }
+    fn close(&mut self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+
+    fn leave_device(&mut self, device: &mut Device) -> Result<(), String> {
+        self.req(json!({"op":"unsubscribe","port":device.port}))?;
+        self.req(json!({"op":"leave","port":device.port}))?;
+        device.joined = false;
+        device.gap = true;
+        Ok(())
+    }
+
+    fn subscribe_device(&mut self, device: &Device) -> Result<(), String> {
+        self.req(json!({"op":"subscribe","port":device.port}))?;
+        Ok(())
+    }
+
     fn req(&mut self, mut f: Value) -> Result<Value, String> {
         self.id += 1;
         f["v"] = json!(V);
@@ -168,6 +189,8 @@ struct Device {
     selection: Option<((u16, u16), (u16, u16))>,
     selecting: bool,
     joined: bool,
+    input_warning: Option<String>,
+    paste_mode_uncertain: bool,
 }
 impl Device {
     fn new(port: String) -> Self {
@@ -180,7 +203,7 @@ impl Device {
             control: "available".into(),
             screen: vt100::Parser::new(
                 rows.saturating_sub(4).max(1),
-                cols.saturating_sub(30).max(1),
+                vt_screen_width(cols),
                 SCROLLBACK,
             ),
             gap: false,
@@ -188,6 +211,8 @@ impl Device {
             selection: None,
             selecting: false,
             joined: false,
+            input_warning: None,
+            paste_mode_uncertain: false,
         }
     }
 }
@@ -309,8 +334,13 @@ fn run() -> Result<(), String> {
     let mut count = hello["mcp_clients"].as_u64().unwrap_or(0).to_string();
     let mut status = "Ready".to_string();
     let mut baud_prompt: Option<String> = None;
+    let mut baud_prompt_target: Option<String> = None;
     let mut baud_change_pending = false;
     let mut baud_confirm = false;
+    let mut baud_size_warning = false;
+    let mut leave_outcome_unknown = false;
+    let mut operation_failure: Option<String> = None;
+    let mut subscription_failed = false;
     let mut literal_next = false;
     let mut daemon_lost = false;
     unsafe {
@@ -323,22 +353,32 @@ fn run() -> Result<(), String> {
     if let Err(e) = execute!(
         out,
         EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        EnableBracketedPaste
     ) {
         let _ = execute!(
             out,
             crossterm::event::DisableMouseCapture,
+            DisableBracketedPaste,
             LeaveAlternateScreen
         );
         let _ = disable_raw_mode();
         return Err(e.to_string());
     }
-    let result = (|| -> Result<(), String> {
+    let mut result = (|| -> Result<(), String> {
         let mut term = Terminal::new(CrosstermBackend::new(out)).map_err(|e| e.to_string())?;
         loop {
             if STOP.load(Ordering::SeqCst) {
                 break;
             }
+            if let Some(i) = active {
+                let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                devs[i]
+                    .screen
+                    .screen_mut()
+                    .set_size(height.saturating_sub(4).max(1), vt_screen_width(width));
+            }
+            let preserve_failure = leave_outcome_unknown || subscription_failed;
             let mut snapshot_ports = HashSet::new();
             let snapshot = c.req(json!({"op":"status"})).ok();
             let snapshot_ok = snapshot
@@ -349,7 +389,7 @@ fn run() -> Result<(), String> {
                     .as_u64()
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| "?".into());
-                if count == "?" {
+                if count == "?" && !preserve_failure {
                     status = "MCP-only client count unavailable".into();
                 }
                 snapshot_ports = s["devices"]
@@ -360,13 +400,21 @@ fn run() -> Result<(), String> {
                     .collect();
             } else {
                 daemon_lost = true;
+                c.close();
+                baud_confirm = false;
+                baud_prompt = None;
+                baud_prompt_target = None;
+                baud_change_pending = false;
+                baud_size_warning = false;
                 if let Some(i) = active.take() {
                     devs[i].joined = false;
                     devs[i].gap = true;
                 }
-                status = "Daemon unavailable · r reconnects · cached screens retained".into();
+                if !preserve_failure {
+                    status = "Daemon unavailable · r reconnects · cached screens retained".into();
+                }
             }
-            if snapshot.is_some() && !snapshot_ok {
+            if snapshot.is_some() && !snapshot_ok && !preserve_failure {
                 status = "Device status incomplete · cached tabs retained".into();
             }
             let ports_result = if daemon_lost {
@@ -399,7 +447,7 @@ fn run() -> Result<(), String> {
                 &mut active,
                 &mut selected,
             );
-            if !tabs_ok {
+            if !tabs_ok && !preserve_failure {
                 status = "Device display limit reached; no inactive tab can be evicted".into();
             }
             if snapshots_complete {
@@ -419,6 +467,10 @@ fn run() -> Result<(), String> {
                     if d.state == "available" && !listed.contains(&d.port) {
                         d.state = "disconnected".into();
                     }
+                    if d.state == "disconnected" {
+                        d.paste_mode_uncertain = false;
+                        d.input_warning = None;
+                    }
                 }
             }
             if c.overflow {
@@ -426,17 +478,27 @@ fn run() -> Result<(), String> {
                 if let Some(i) = active {
                     devs[i].gap = true;
                 }
-                status = "Daemon event queue overflow — output/settings may be incomplete".into();
+                if !preserve_failure {
+                    status =
+                        "Daemon event queue overflow — output/settings may be incomplete".into();
+                }
             }
             while let Some(ev) = c.events.pop_front() {
                 match ev["event"].as_str().unwrap_or("") {
                     "shutdown" => {
                         daemon_lost = true;
+                        baud_confirm = false;
+                        baud_prompt = None;
+                        baud_prompt_target = None;
+                        baud_change_pending = false;
+                        baud_size_warning = false;
                         if let Some(i) = active.take() {
                             devs[i].joined = false;
                             devs[i].gap = true;
                         }
-                        status = "Daemon shutting down · cached screens retained".into();
+                        if !preserve_failure {
+                            status = "Daemon shutting down · cached screens retained".into();
+                        }
                     }
                     "event_gap" => {
                         if let Some(i) = active {
@@ -473,16 +535,38 @@ fn run() -> Result<(), String> {
                             d.gap = true;
                         }
                         "device" if ev["state"] == "disconnected" => {
+                            if Some(idx) == active
+                                || baud_prompt_target.as_deref() == Some(d.port.as_str())
+                            {
+                                baud_confirm = false;
+                                baud_prompt = None;
+                                baud_prompt_target = None;
+                                baud_change_pending = false;
+                            }
                             d.state = "disconnected".into();
+                            d.paste_mode_uncertain = false;
+                            d.input_warning = None;
                             d.joined = false;
                             d.gap = true;
+                            let mut leave_failed = false;
                             if Some(idx) == active {
-                                let _ = c.req(json!({"op":"leave","port":d.port}));
+                                if let Err(error) = c.leave_device(d) {
+                                    c.close();
+                                    daemon_lost = true;
+                                    leave_outcome_unknown = true;
+                                    let failure = leave_failure_status(&error);
+                                    operation_failure = Some(failure.clone());
+                                    status = failure;
+                                    leave_failed = true;
+                                }
                                 active = None;
                                 selected = idx;
                             }
-                            status =
-                                "Device disconnected · select and press Enter to reconnect".into();
+                            if !leave_failed {
+                                status =
+                                    "Device disconnected · select and press Enter to reconnect"
+                                        .into();
+                            }
                         }
                         "settings" => {
                             d.baud = ev["baudrate"]
@@ -496,9 +580,26 @@ fn run() -> Result<(), String> {
             }
             if let Some(i) = active {
                 if !devs[i].joined {
-                    let _ = c.req(json!({"op":"subscribe","port":devs[i].port}));
-                    devs[i].joined = true;
+                    match c.subscribe_device(&devs[i]) {
+                        Ok(()) => {
+                            devs[i].joined = true;
+                            subscription_failed = false;
+                        }
+                        Err(error) => {
+                            c.close();
+                            daemon_lost = true;
+                            subscription_failed = true;
+                            devs[i].gap = true;
+                            active = None;
+                            let failure = subscription_failure_status(&error);
+                            operation_failure = Some(failure.clone());
+                            status = failure;
+                        }
+                    }
                 }
+            }
+            if let Some(failure) = operation_failure.as_ref() {
+                status = failure.clone();
             }
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
             let narrow = term_width < 64;
@@ -511,29 +612,163 @@ fn run() -> Result<(), String> {
             } else {
                 28
             };
-            let prompt_header = if baud_confirm {
+            let gap_device = active.filter(|&i| devs[i].gap).or_else(|| {
+                devs.get(selected)
+                    .is_some_and(|device| device.gap)
+                    .then_some(selected)
+            });
+            let gap_header_rows = term_height.saturating_sub(3).max(1);
+            let warning_device = active.or(gap_device).or_else(|| {
+                (!devs.is_empty()).then_some(selected.min(devs.len().saturating_sub(1)))
+            });
+            let input_warning = warning_device.and_then(|i| devs[i].input_warning.as_ref());
+            let paste_mode_uncertain = warning_device.is_some_and(|i| devs[i].paste_mode_uncertain);
+            let mut display_status = input_warning.map_or_else(
+                || status.clone(),
+                |warning| {
+                    if status.starts_with(warning) {
+                        status.clone()
+                    } else {
+                        format!("{warning} · {status}")
+                    }
+                },
+            );
+            if leave_outcome_unknown
+                && !display_status
+                    .to_ascii_lowercase()
+                    .contains("leave outcome unknown")
+            {
+                display_status.push_str(" · Leave outcome unknown; r reconnects");
+            }
+            if subscription_failed
+                && !display_status
+                    .to_ascii_lowercase()
+                    .contains("subscription failed")
+            {
+                display_status.push_str(" · Output subscription failed; r reconnects, then rejoin");
+            }
+            if daemon_lost && !display_status.to_ascii_lowercase().contains("r reconnects") {
+                display_status.push_str(" · Daemon unavailable; r reconnects");
+            }
+            if gap_device.is_some_and(|i| devs[i].state == "disconnected")
+                && !display_status
+                    .to_ascii_lowercase()
+                    .contains("device disconnected")
+            {
+                display_status
+                    .push_str(" · Device disconnected; select and press Enter to reconnect");
+            }
+            if paste_mode_uncertain
+                && !display_status
+                    .to_ascii_lowercase()
+                    .contains("application may remain in paste mode")
+            {
+                display_status.push_str(
+                    " · Paste mode outcome unknown; application may remain in paste mode",
+                );
+            }
+            let prompt_header = if leave_outcome_unknown {
+                Some(gap_device.map_or_else(
+                    || recovery_prompt_header(&display_status, term_width, gap_header_rows),
+                    |i| {
+                        gap_prompt_header(
+                            &devs[i],
+                            &count,
+                            &display_status,
+                            term_width,
+                            gap_header_rows,
+                        )
+                    },
+                ))
+            } else if subscription_failed {
+                Some(gap_device.map_or_else(
+                    || recovery_prompt_header(&display_status, term_width, gap_header_rows),
+                    |i| {
+                        gap_prompt_header(
+                            &devs[i],
+                            &count,
+                            &display_status,
+                            term_width,
+                            gap_header_rows,
+                        )
+                    },
+                ))
+            } else if daemon_lost {
+                Some(gap_device.map_or_else(
+                    || recovery_prompt_header(&display_status, term_width, gap_header_rows),
+                    |i| {
+                        gap_prompt_header(
+                            &devs[i],
+                            &count,
+                            &display_status,
+                            term_width,
+                            gap_header_rows,
+                        )
+                    },
+                ))
+            } else if baud_confirm {
                 let candidates = [
                     format!(" serial-mcp · MCP clients: {count}\n Shared baud affects all clients. Confirm y/n"),
                     format!("MCP{count}\nShared baud affects all\nConfirm y/n"),
                     "Shared baud? y/n".to_owned(),
                     "y/n".to_owned(),
                 ];
-                Some(fitting_prompt(&candidates, term_width, term_height))
-            } else {
-                baud_prompt.as_ref().map(|baud| {
-                    let candidates = [
+                Some(
+                    fitting_prompt(&candidates, term_width, term_height)
+                        .unwrap_or_else(|| "Resize".to_owned()),
+                )
+            } else if let Some(baud) = baud_prompt.as_ref() {
+                let candidates = [
                         format!(" serial-mcp · MCP clients: {count}\n Baud rate 1–4000000: {baud} · Enter confirms · Esc cancels"),
                         format!("MCP{count}\nBaud:{baud}\nRange 1-4000000\nEnter=apply\nEsc=cancel"),
                         format!("Baud:{baud}\n1-4000000\nEnter apply/Esc cancel"),
                         format!("Baud {baud} Enter apply/Esc cancel"),
-                        format!("E/Esc {baud}"),
+                        format!("{baud} Enter apply/Esc cancel"),
                     ];
+                Some(
                     fitting_prompt(&candidates, term_width, term_height)
+                        .unwrap_or_else(|| "Resize".to_owned()),
+                )
+            } else if input_warning.is_some() && gap_device.is_none() {
+                Some(input_warning_header(
+                    &display_status,
+                    term_width,
+                    gap_header_rows,
+                    None,
+                ))
+            } else if baud_size_warning {
+                Some(if term_width < 7 {
+                    "Resize".to_owned()
+                } else if term_width < 20 {
+                    "Resize terminal".to_owned()
+                } else {
+                    "Resize terminal to change baud".to_owned()
+                })
+            } else {
+                gap_device.map(|i| {
+                    gap_prompt_header(
+                        &devs[i],
+                        &count,
+                        &display_status,
+                        term_width,
+                        gap_header_rows,
+                    )
                 })
             };
+            let gap_header_visible = !baud_confirm
+                && baud_prompt.is_none()
+                && !baud_size_warning
+                && (gap_device.is_some() || input_warning.is_some());
             let header_height = prompt_header
                 .as_ref()
-                .map(|header| prompt_header_height(header, term_width, term_height))
+                .map(|header| {
+                    let rows = prompt_header_height(header, term_width, term_height);
+                    if gap_header_visible {
+                        rows.min(gap_header_rows)
+                    } else {
+                        rows
+                    }
+                })
                 .unwrap_or(2);
             let pane_content_top = header_height.saturating_add(1);
             let screen_rows = term_height.saturating_sub(4).max(1);
@@ -544,14 +779,11 @@ fn run() -> Result<(), String> {
             let visible_devices = pane_height as usize;
             let screen_row_offset = screen_rows.saturating_sub(pane_height);
             let sidebar_offset = selected.saturating_add(1).saturating_sub(visible_devices);
-            for device in &mut devs {
-                device.screen.screen_mut().set_size(
-                    screen_rows,
-                    term_width
-                        .saturating_sub(sidebar_width)
-                        .saturating_sub(2)
-                        .max(1),
-                );
+            if let Some(i) = active {
+                devs[i]
+                    .screen
+                    .screen_mut()
+                    .set_size(screen_rows, vt_screen_width(term_width));
             }
             term.draw(|f| {
                 let size = f.area();
@@ -608,7 +840,7 @@ fn run() -> Result<(), String> {
                     .take(visible_devices)
                     .map(|(i, d)| {
                         ListItem::new(format!(
-                            "{} {}  {} · {} baud · control {}",
+                            "{}{} {}  {} · {} baud · control {}",
                             if Some(i) == active {
                                 "●"
                             } else if i == selected {
@@ -616,6 +848,7 @@ fn run() -> Result<(), String> {
                             } else {
                                 " "
                             },
+                            if d.gap { " GAP" } else { "" },
                             d.port,
                             d.state,
                             d.baud,
@@ -720,16 +953,29 @@ fn run() -> Result<(), String> {
             if event::poll(Duration::from_millis(80)).map_err(|e| e.to_string())? {
                 match event::read().map_err(|e| e.to_string())? {
                     Event::Resize(cols, rows) => {
-                        for device in &mut devs {
-                            device.screen.screen_mut().set_size(
+                        if !baud_dialog_supported(cols, rows)
+                            && (baud_confirm || baud_prompt.is_some())
+                        {
+                            baud_confirm = false;
+                            baud_prompt = None;
+                            baud_prompt_target = None;
+                            baud_change_pending = false;
+                            baud_size_warning = true;
+                            status = "Resize terminal to change baud".into();
+                        } else if baud_size_warning && baud_dialog_supported(cols, rows) {
+                            baud_size_warning = false;
+                            status = "Ready".into();
+                        }
+                        if let Some(i) = active {
+                            devs[i].screen.screen_mut().set_size(
                                 rows.saturating_sub(4).max(1),
-                                cols.saturating_sub(30).max(1),
+                                vt_screen_width(cols),
                             );
                         }
                     }
                     Event::Key(k) if k.code == KeyCode::Char('q') && active.is_none() => break,
                     Event::Key(k) if k.code==KeyCode::Char('r') && daemon_lost => {
-                        match connect_or_start_daemon(){Ok(mut new_client)=>match new_client.req(json!({"op":"hello","role":"human","name":"rust-human-terminal","pid":std::process::id()})){Ok(h) if h["mcp_clients"].as_u64().is_some()=>{if let Some(i)=active.take(){devs[i].joined=false;devs[i].gap=true;}count=h["mcp_clients"].as_u64().unwrap_or(0).to_string();c=new_client;daemon_lost=false;status="Reconnected · select device explicitly".into();},_=>status="Daemon reconnect failed".into()},Err(_)=>status="Daemon reconnect failed".into()}
+                        match connect_or_start_daemon(){Ok(mut new_client)=>match new_client.req(json!({"op":"hello","role":"human","name":"rust-human-terminal","pid":std::process::id()})){Ok(h) if h["mcp_clients"].as_u64().is_some()=>{if let Some(i)=active.take(){devs[i].joined=false;devs[i].gap=true;}count=h["mcp_clients"].as_u64().unwrap_or(0).to_string();c=new_client;daemon_lost=false;leave_outcome_unknown=false;subscription_failed=false;operation_failure=None;status="Reconnected · select device explicitly".into();},_=>status="Daemon reconnect failed".into()},Err(_)=>status="Daemon reconnect failed".into()}
                     }
                     Event::Key(k)
                         if ((k.code == KeyCode::Char(']')
@@ -739,38 +985,84 @@ fn run() -> Result<(), String> {
                             || k.code == KeyCode::Char('\x1d'))
                             && !literal_next =>
                     {
-                        baud_prompt=None;baud_change_pending=false;baud_confirm=false;
+                        baud_prompt=None;baud_prompt_target=None;baud_change_pending=false;baud_confirm=false;baud_size_warning=false;
                         if let Some(i) = active.take() {
-                            let _ = c.req(json!({"op":"unsubscribe","port":devs[i].port}));
-                            let _ = c.req(json!({"op":"leave","port":devs[i].port}));
-                            devs[i].joined = false;
-                            devs[i].gap = true;
+                            match c.leave_device(&mut devs[i]) {
+                                Ok(()) => status = "Sidebar".into(),
+                                Err(error) => {
+                                    c.close();
+                                    daemon_lost = true;
+                                    leave_outcome_unknown = true;
+                                    devs[i].joined = false;
+                                    devs[i].gap = true;
+                                    let failure = leave_failure_status(&error);
+                                    operation_failure = Some(failure.clone());
+                                    status = failure;
+                                }
+                            }
+                        } else {
+                            status = "Sidebar".into();
                         }
-                        status = "Sidebar".into()
                     }
                     Event::Key(k) if baud_confirm => {
-                        baud_confirm=false;
-                        if k.code==KeyCode::Char('y') { baud_change_pending=true; baud_prompt=Some(String::new()); status="Enter shared baud rate".into(); }
-                        else { status="Baud change cancelled".into(); }
+                        baud_confirm = false;
+                        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                        if !baud_dialog_supported(width, height) {
+                            baud_size_warning = true;
+                            status = "Resize terminal to change baud".into();
+                        } else if k.code == KeyCode::Char('y') {
+                            baud_size_warning = false;
+                            baud_change_pending = true;
+                            baud_prompt_target = active.map(|i| devs[i].port.clone());
+                            baud_prompt = Some(String::new());
+                            status = "Enter shared baud rate".into();
+                        } else {
+                            status = "Baud change cancelled".into();
+                        }
                     }
                     Event::Key(k) if baud_prompt.is_some() => {
+                        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                        if !baud_dialog_supported(width, height) {
+                            baud_prompt = None;
+                            baud_prompt_target = None;
+                            baud_change_pending = false;
+                            baud_size_warning = true;
+                            status = "Resize terminal to change baud".into();
+                            continue;
+                        }
                         match k.code {
-                            KeyCode::Char(c) if c.is_ascii_digit() => { baud_prompt.as_mut().unwrap().push(c) }
-                            KeyCode::Char(_) => { baud_prompt=None; baud_change_pending=false; status="Invalid baud rate; digits only".into(); }
+                            KeyCode::Char(c) if c.is_ascii_digit() => {
+                                let baud = baud_prompt.as_mut().unwrap();
+                                if !push_baud_digit(baud, c) {
+                                    baud_prompt = None;
+                                    baud_prompt_target = None;
+                                    baud_change_pending = false;
+                                    status = "Baud entry is limited to 7 digits".into();
+                                }
+                            }
+                            KeyCode::Char(_) => { baud_prompt=None; baud_prompt_target=None; baud_change_pending=false; status="Invalid baud rate; digits only".into(); }
                             KeyCode::Backspace => {
                                 baud_prompt.as_mut().unwrap().pop();
                             }
                             KeyCode::Esc => {
                                 baud_prompt = None;
+                                baud_prompt_target = None;
                                 baud_change_pending=false;
                                 status = "Baud entry cancelled".into();
                             }
                             KeyCode::Enter => {
+                                let Some(i) = baud_prompt_target.take().and_then(|port| {
+                                    devs.iter().position(|device| device.port == port)
+                                }) else {
+                                    baud_prompt = None;
+                                    baud_change_pending = false;
+                                    status = "Baud target is no longer available".into();
+                                    continue;
+                                };
                                 let changing=std::mem::take(&mut baud_change_pending);
                                 let raw = baud_prompt.take().unwrap();
                                 match raw.parse::<u32>() {
                                     Ok(baud) if (1..=4_000_000).contains(&baud) => {
-                                        let i = active.unwrap_or(selected);
                                         if changing {
                                             match c.req(json!({"op":"human_set_baudrate","port":devs[i].port,"baudrate":baud})) {
                                                 Ok(result)=>{devs[i].baud=result["baudrate"].as_u64().map(|v|v.to_string()).unwrap_or(baud.to_string());status="Shared baud changed; other participants notified".into();},
@@ -778,7 +1070,29 @@ fn run() -> Result<(), String> {
                                             }
                                         } else {
                                             match c.req(json!({"op":"join","port":devs[i].port,"baudrate":baud})) {
-                                                Ok(joined) => { devs[i].device_id=joined["device_id"].as_str().map(str::to_owned); devs[i].baud=joined["baudrate"].as_u64().map(|v|v.to_string()).unwrap_or(devs[i].baud.clone()); let _=c.req(json!({"op":"subscribe","port":devs[i].port})); devs[i].joined=true; devs[i].state="connected".into(); active=Some(i); status="Connected · Ctrl-] leaves".into(); },
+                                                Ok(joined) => {
+                                                    devs[i].device_id=joined["device_id"].as_str().map(str::to_owned);
+                                                    devs[i].baud=joined["baudrate"].as_u64().map(|v|v.to_string()).unwrap_or(devs[i].baud.clone());
+                                                    devs[i].state="connected".into();
+                                                    if let Err(error) = c.subscribe_device(&devs[i]) {
+                                                        c.close();
+                                                        daemon_lost = true;
+                                                        subscription_failed = true;
+                                                        devs[i].gap = true;
+                                                        devs[i].joined = false;
+                                                        let failure = subscription_failure_status(&error);
+                                                        operation_failure = Some(failure.clone());
+                                                        status = failure;
+                                                    } else {
+                                                        devs[i].joined=true;
+                                                        active=Some(i);
+                                                        baud_size_warning=false;
+                                                        leave_outcome_unknown=false;
+                                                        subscription_failed=false;
+                                                        literal_next=false;
+                                                        status="Connected · Ctrl-] leaves".into();
+                                                    }
+                                                },
                                                 Err(e) => status=format!("Join failed: {e}")
                                             }
                                         }
@@ -791,29 +1105,69 @@ fn run() -> Result<(), String> {
                             _ => {}
                         }
                     }
+                    Event::Key(_) if daemon_lost || leave_outcome_unknown || subscription_failed => {}
                     Event::Key(k) if active.is_none() => match k.code {
                         KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
                         KeyCode::Down | KeyCode::Char('j') => { selected = (selected + 1).min(devs.len().saturating_sub(1)) }
                         KeyCode::Char('d') if !devs.is_empty() => {
-                            let i=selected; let _=c.req(json!({"op":"leave","port":devs[i].port}));
-                            devs[i].joined=false;devs[i].gap=true;status="Disconnected from selected device".into();
+                            let i = selected;
+                            if devs[i].joined {
+                                match c.leave_device(&mut devs[i]) {
+                                    Ok(()) => status = "Disconnected from selected device".into(),
+                                    Err(error) => {
+                                        c.close();
+                                        daemon_lost = true;
+                                        leave_outcome_unknown = true;
+                                        devs[i].joined = false;
+                                        devs[i].gap = true;
+                                        let failure = leave_failure_status(&error);
+                                        operation_failure = Some(failure.clone());
+                                        status = failure;
+                                    }
+                                }
+                            } else {
+                                status = "Not joined to selected device".into();
+                            }
                         }
                         KeyCode::Enter if !devs.is_empty() => {
                             let i = selected;
                             if devs[i].state == "connected" {
                                 match c.req(json!({"op":"join","port":devs[i].port})) {
                                     Ok(joined) => {
-                                        devs[i].device_id=joined["device_id"].as_str().map(str::to_owned);
-                                        let _ = c.req(json!({"op":"subscribe","port":devs[i].port}));
-                                        devs[i].joined = true;
-                                        active = Some(i);
-                                        status = "Connected · Ctrl-] leaves".into();
+                                        if let Err(error) = c.subscribe_device(&devs[i]) {
+                                            c.close();
+                                            daemon_lost = true;
+                                            subscription_failed = true;
+                                            devs[i].gap = true;
+                                            devs[i].joined = false;
+                                            let failure = subscription_failure_status(&error);
+                                            operation_failure = Some(failure.clone());
+                                            status = failure;
+                                        } else {
+                                            devs[i].device_id=joined["device_id"].as_str().map(str::to_owned);
+                                            devs[i].joined = true;
+                                            active = Some(i);
+                                            baud_size_warning = false;
+                                            leave_outcome_unknown = false;
+                                            subscription_failed = false;
+                                            operation_failure = None;
+                                            literal_next = false;
+                                            status = "Connected · Ctrl-] leaves".into();
+                                        }
                                     }
                                     Err(e) => status = format!("Join failed: {e}"),
                                 }
                             } else {
-                                baud_prompt = Some(String::new());
-                                status = "Enter baud rate".into();
+                                let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                                if baud_dialog_supported(width, height) {
+                                    baud_size_warning = false;
+                                    baud_prompt_target = Some(devs[i].port.clone());
+                                    baud_prompt = Some(String::new());
+                                    status = "Enter baud rate".into();
+                                } else {
+                                    baud_size_warning = true;
+                                    status = "Resize terminal to change baud".into();
+                                }
                             }
                         }
                         _ => {}
@@ -831,16 +1185,33 @@ fn run() -> Result<(), String> {
                     }
                     Event::Key(k) if active.is_some() && k.code == KeyCode::Esc && !literal_next => {
                         if let Some(i) = active.take() {
-                            let _ = c.req(json!({"op":"unsubscribe","port":devs[i].port}));
-                            let _ = c.req(json!({"op":"leave","port":devs[i].port}));
-                            devs[i].joined = false;
-                            devs[i].gap = true;
+                            match c.leave_device(&mut devs[i]) {
+                                Ok(()) => status = "Sidebar".into(),
+                                Err(error) => {
+                                    c.close();
+                                    daemon_lost = true;
+                                    leave_outcome_unknown = true;
+                                    devs[i].joined = false;
+                                    devs[i].gap = true;
+                                    let failure = leave_failure_status(&error);
+                                    operation_failure = Some(failure.clone());
+                                    status = failure;
+                                }
+                            }
                         }
-                        status = "Sidebar".into();
+                        baud_size_warning = false;
+                        literal_next = false;
                     }
                     Event::Key(k) if active.is_some() && !literal_next && (k.code==KeyCode::Char('b') || k.code==KeyCode::Char('B')) && k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        baud_confirm=true;
-                        status="Changing baud affects all participants and may disrupt active AI work. Confirm y/n".into();
+                        let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+                        if baud_dialog_supported(width, height) {
+                            baud_size_warning = false;
+                            baud_confirm = true;
+                            status="Changing baud affects all participants and may disrupt active AI work. Confirm y/n".into();
+                        } else {
+                            baud_size_warning = true;
+                            status="Resize terminal to change baud".into();
+                        }
                     }
                     Event::Key(k) => {
                         if let Some(i) = active {
@@ -870,20 +1241,120 @@ fn run() -> Result<(), String> {
                                     "port": devs[i].port,
                                     "data": base64_encode(&bytes)
                                 })) {
-                                    status = format!("Input outcome unknown: {e}; not replayed");
+                                    let warning = format!("Input outcome unknown: {e}; not replayed");
+                                    devs[i].input_warning = Some(warning.clone());
+                                    status = warning;
                                 }
                             }
                         }
                     }
+                    Event::Paste(_) if baud_confirm || baud_prompt.is_some() => {}
                     Event::Paste(text) if active.is_some() => {
                         if let Some(i) = active {
-                            for chunk in text.as_bytes().chunks(64 * 1024) {
-                                if let Err(e)=c.req(json!({"op":"input","port":devs[i].port,"data":base64_encode(chunk)})) {
-                                    status=format!("Paste outcome unknown: {e}; remaining bytes were not sent"); break;
+                            let bracketed = devs[i].screen.screen().bracketed_paste();
+                            let mut failed = false;
+                            if bracketed {
+                                if let Err(error) = c.req(json!({
+                                    "op": "input",
+                                    "port": devs[i].port,
+                                    "data": base64_encode(b"\x1b[200~")
+                                })) {
+                                    let close_result = c.req(json!({
+                                        "op": "input",
+                                        "port": devs[i].port,
+                                        "data": base64_encode(b"\x1b[201~")
+                                    }));
+                                    let warning = match close_result {
+                                        Ok(_) => {
+                                            devs[i].paste_mode_uncertain = false;
+                                            format!(
+                                                "Paste opening delimiter outcome unknown ({error}); closing delimiter sent; body not sent"
+                                            )
+                                        },
+                                        Err(_) => {
+                                            devs[i].paste_mode_uncertain = true;
+                                            format!(
+                                                "Paste opening delimiter outcome unknown ({error}); closing delimiter outcome unknown; application may remain in paste mode"
+                                            )
+                                        }
+                                    };
+                                    devs[i].input_warning = Some(warning.clone());
+                                    status = warning;
+                                    failed = true;
+                                }
+                            }
+                            if !failed {
+                                for chunk in text.as_bytes().chunks(64 * 1024) {
+                                    if let Err(error) = c.req(json!({
+                                        "op": "input",
+                                        "port": devs[i].port,
+                                        "data": base64_encode(chunk)
+                                    })) {
+                                        let close_result = if bracketed {
+                                            c.req(json!({
+                                                "op": "input",
+                                                "port": devs[i].port,
+                                                "data": base64_encode(b"\x1b[201~")
+                                            }))
+                                        } else {
+                                            Ok(json!({}))
+                                        };
+                                        let close_note = if bracketed {
+                                            match close_result {
+                                                Ok(_) => {
+                                                    devs[i].paste_mode_uncertain = false;
+                                                    "closing delimiter sent"
+                                                },
+                                                Err(_) => {
+                                                    devs[i].paste_mode_uncertain = true;
+                                                    "closing delimiter outcome unknown; application may remain in paste mode"
+                                                }
+                                            }
+                                        } else {
+                                            ""
+                                        };
+                                        let warning = format!(
+                                            "Paste body chunk outcome unknown: {error}; remaining bytes were not sent; {close_note}"
+                                        );
+                                        devs[i].input_warning = Some(warning.clone());
+                                        status = warning;
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if bracketed && !failed {
+                                match c.req(json!({
+                                    "op": "input",
+                                    "port": devs[i].port,
+                                    "data": base64_encode(b"\x1b[201~")
+                                })) {
+                                    Ok(_) => {
+                                        devs[i].paste_mode_uncertain = false;
+                                        if let Some(warning) = devs[i].input_warning.as_mut() {
+                                            if warning.contains("application may remain in paste mode") {
+                                                let previous = warning.clone();
+                                                let resolved = resolve_paste_mode_warning(warning);
+                                                if status.starts_with(&previous) {
+                                                    status = status.replacen(&previous, &resolved, 1);
+                                                }
+                                                *warning = resolved;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        devs[i].paste_mode_uncertain = true;
+                                        let warning = format!(
+                                            "Paste body sent; closing delimiter outcome unknown ({error}); application may remain in paste mode"
+                                        );
+                                        devs[i].input_warning = Some(warning.clone());
+                                        status = warning;
+                                    }
                                 }
                             }
                         }
                     }
+                    Event::Mouse(_) if baud_confirm || baud_prompt.is_some() => {}
                     Event::Mouse(m) if active.is_some() && pane_height > 0 && m.column>=sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) && !m.modifiers.contains(KeyModifiers::SHIFT) && active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()!=vt100::MouseProtocolMode::None) => {
                         if let Some(i)=active {
                             let screen=devs[i].screen.screen();
@@ -894,7 +1365,7 @@ fn run() -> Result<(), String> {
                                 .saturating_add(screen_row_offset)
                                 .max(1);
                             if let Some(bytes)=encode_mouse(screen.mouse_protocol_mode(),screen.mouse_protocol_encoding(),m.kind,m.modifiers,col,row) {
-                                if let Err(e)=c.req(json!({"op":"input","port":devs[i].port,"data":base64_encode(&bytes)})){status=format!("Mouse input outcome unknown: {e}; not replayed");}
+                                if let Err(e)=c.req(json!({"op":"input","port":devs[i].port,"data":base64_encode(&bytes)})){let warning=format!("Mouse input outcome unknown: {e}; not replayed");devs[i].input_warning=Some(warning.clone());status=warning;}
                             }
                         }
                     }
@@ -926,15 +1397,40 @@ fn run() -> Result<(), String> {
                     Event::Mouse(m)
                         if m.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left) =>
                     {
-                        if pane_height > 0 && m.column < sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) {
-                            if let Some(i) = active.take() {
-                                let _ = c.req(json!({"op":"unsubscribe","port":devs[i].port}));
-                                let _ = c.req(json!({"op":"leave","port":devs[i].port}));
-                                devs[i].joined = false;
-                                devs[i].gap = true;
-                            }
-                            selected = sidebar_offset.saturating_add((m.row as usize).saturating_sub(pane_content_top as usize)).min(devs.len().saturating_sub(1));
-                            status = "Device selected · Enter joins".into();
+                        let target = sidebar_hit_target(
+                            m.row,
+                            pane_content_top,
+                            sidebar_offset,
+                            visible_devices,
+                            devs.len(),
+                        );
+                        if let Some(target) = target.filter(|_| {
+                            m.column < sidebar_width && m.row < term_height.saturating_sub(1)
+                        }) {
+                            let leave_error = if let Some(i) = active.take() {
+                                match c.leave_device(&mut devs[i]) {
+                                    Ok(()) => None,
+                                    Err(error) => {
+                                        c.close();
+                                        daemon_lost = true;
+                                        leave_outcome_unknown = true;
+                                        devs[i].joined = false;
+                                        devs[i].gap = true;
+                                        let failure = leave_failure_status(&error);
+                                        operation_failure = Some(failure);
+                                        Some(error)
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            selected = target;
+                            literal_next = false;
+                            baud_size_warning = false;
+                            status = leave_error.map_or_else(
+                                || "Device selected · Enter joins".into(),
+                                |error| leave_failure_status(&error),
+                            );
                         }
                     }
                     _ => {}
@@ -944,12 +1440,18 @@ fn run() -> Result<(), String> {
         Ok(())
     })();
     if let Some(i) = active {
-        let _ = c.req(json!({"op":"leave","port":devs[i].port}));
+        if let Err(error) = c.leave_device(&mut devs[i]) {
+            c.close();
+            result = Err(format!(
+                "could not leave device on exit; daemon connection closed for cleanup: {error}"
+            ));
+        }
     }
     let mut out = std::io::stdout();
     let _ = execute!(
         out,
         crossterm::event::DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen
     );
     let _ = disable_raw_mode();
@@ -1188,18 +1690,927 @@ fn prompt_header_height(text: &str, width: u16, height: u16) -> u16 {
     wrapped_rows(text, width).min(height.max(1))
 }
 
-fn fitting_prompt(candidates: &[String], width: u16, height: u16) -> String {
-    if let Some(candidate) = candidates
-        .iter()
-        .find(|candidate| wrapped_rows(candidate, width) <= height)
-    {
-        return candidate.clone();
+fn leave_failure_status(error: &str) -> String {
+    format!("Leave outcome unknown; connection closed for cleanup; r reconnects: {error}")
+}
+
+fn subscription_failure_status(error: &str) -> String {
+    format!("Output subscription failed; r reconnects, then rejoin: {error}")
+}
+
+fn recovery_prompt_header(status: &str, width: u16, available_rows: u16) -> String {
+    if status_indicates_input_uncertainty(status) {
+        return input_warning_header(status, width, available_rows, None);
     }
+    let lower = status.to_ascii_lowercase();
+    let leaving = lower.contains("leave outcome unknown");
+    let subscription = lower.contains("subscription");
+    let reconnect = if width < 12 { "r retry" } else { "r reconnect" };
+
+    if available_rows <= 1 {
+        return if leaving && width >= 8 {
+            "Leave? r".to_owned()
+        } else if subscription && width >= 8 {
+            "Sub? r".to_owned()
+        } else if width >= 8 {
+            "D lost r".to_owned()
+        } else {
+            reconnect.to_owned()
+        };
+    }
+
+    let full = if leaving {
+        "Leave outcome unknown · connection closed for cleanup · r reconnects"
+    } else if subscription {
+        "Output subscription failed; r reconnects, then rejoin"
+    } else {
+        "Daemon unavailable · r reconnects"
+    };
+    if available_rows > 2 && wrapped_rows(full, width) <= available_rows {
+        return full.into();
+    }
+
+    let label = if leaving {
+        if width < 16 {
+            "Leave?"
+        } else {
+            "Leave uncertain"
+        }
+    } else if subscription {
+        if width < 12 {
+            "Sub?"
+        } else if width < 16 {
+            "Sub failed"
+        } else {
+            "Subscribe failed"
+        }
+    } else if width < 12 {
+        "D lost"
+    } else if width < 18 {
+        "Daemon lost"
+    } else {
+        "Daemon unavailable"
+    };
+    format!("{label}\n{reconnect}")
+}
+
+fn resolve_paste_mode_warning(warning: &str) -> String {
+    if let Some((prefix, _)) = warning.split_once("; closing delimiter outcome unknown") {
+        format!("{prefix}; a closing delimiter was later sent")
+    } else if let Some((prefix, _)) = warning.split_once("; application may remain in paste mode") {
+        format!("{prefix}; a closing delimiter was later sent")
+    } else {
+        warning.to_owned()
+    }
+}
+
+fn status_indicates_input_uncertainty(status: &str) -> bool {
+    let lower = status.to_ascii_lowercase();
+    lower.contains("input outcome unknown")
+        || (lower.contains("paste") && lower.contains("outcome unknown"))
+}
+
+fn input_warning_header(
+    status: &str,
+    width: u16,
+    available_rows: u16,
+    count: Option<&str>,
+) -> String {
+    let lower = status.to_ascii_lowercase();
+    let recovery = lower.contains("r reconnects")
+        || lower.contains("daemon unavailable")
+        || lower.contains("daemon shutting down")
+        || lower.contains("subscription failed");
+    let paste = lower.contains("paste") && lower.contains("outcome unknown");
+    let paste_open = paste && lower.contains("opening delimiter");
+    let paste_body =
+        paste && (lower.contains("body chunk") || lower.contains("remaining bytes were not sent"));
+    let paste_close = paste && lower.contains("closing delimiter outcome unknown");
+    let paste_mode_uncertain =
+        paste_close || lower.contains("application may remain in paste mode");
+    let mouse = lower.contains("mouse input outcome unknown");
+    let leaving = lower.contains("leave outcome unknown");
+    let disconnected = lower.contains("device disconnected");
+    let join_failed = lower.contains("join failed");
+    let unavailable = lower.contains("unavailable");
+    let other_failure = lower.contains("failed") || lower.contains("incomplete");
+    let no_replay =
+        lower.contains("not replayed") || lower.contains("remaining bytes were not sent");
+
+    if available_rows >= 3 && wrapped_rows(status, width) <= available_rows {
+        return status.to_owned();
+    }
+
+    let warning = if paste_body {
+        if width >= 8 {
+            "Partial?"
+        } else {
+            "P?part"
+        }
+    } else if paste_open {
+        if width >= 13 {
+            "Open? unknown"
+        } else {
+            "Open?"
+        }
+    } else if paste_close {
+        if width >= 9 {
+            "Body sent"
+        } else {
+            "Sent?"
+        }
+    } else if paste_mode_uncertain && !paste_open && !paste_body {
+        if lower.contains("input outcome unknown") {
+            if width >= 14 {
+                "Input? unknown"
+            } else {
+                "Input?"
+            }
+        } else if width >= 11 {
+            "Paste mode?"
+        } else {
+            "Mode?"
+        }
+    } else if paste {
+        if width >= 9 {
+            "Paste?"
+        } else {
+            "P?"
+        }
+    } else if mouse {
+        if width >= 14 {
+            "Mouse? unknown"
+        } else {
+            "Mouse?"
+        }
+    } else if width >= 14 {
+        "Input? unknown"
+    } else {
+        "Unknown"
+    };
+
+    if available_rows <= 1 {
+        let line = if paste_mode_uncertain {
+            if paste_body {
+                if recovery {
+                    if width >= 13 {
+                        "Part? NR M? r"
+                    } else if width >= 9 {
+                        "P? NR M?r"
+                    } else {
+                        "NR M?r"
+                    }
+                } else if disconnected {
+                    if width >= 13 {
+                        "Part? NR M? E"
+                    } else {
+                        "NR M? E"
+                    }
+                } else if leaving {
+                    if width >= 16 {
+                        "Part? NR M? L? r"
+                    } else {
+                        "NR M? r"
+                    }
+                } else if width >= 8 {
+                    "P? NR M?"
+                } else {
+                    "NR M?"
+                }
+            } else if paste_open {
+                if recovery {
+                    if width >= 10 {
+                        "Open? M? r"
+                    } else {
+                        "O? M? r"
+                    }
+                } else if disconnected {
+                    if width >= 10 {
+                        "Open? M? E"
+                    } else {
+                        "O? M? E"
+                    }
+                } else if leaving {
+                    if width >= 13 {
+                        "Open? M? L? r"
+                    } else {
+                        "O? M? r"
+                    }
+                } else if width >= 8 {
+                    "Open? M?"
+                } else {
+                    "O? M?"
+                }
+            } else if paste_close {
+                if recovery {
+                    if width >= 10 {
+                        "Sent? M? r"
+                    } else {
+                        "S? M? r"
+                    }
+                } else if disconnected {
+                    if width >= 10 {
+                        "Sent? M? E"
+                    } else {
+                        "S? M? E"
+                    }
+                } else if leaving {
+                    if width >= 13 {
+                        "Sent? M? L? r"
+                    } else {
+                        "S? M? r"
+                    }
+                } else if width >= 16 {
+                    "Body sent; mode?"
+                } else if width >= 8 {
+                    "Sent? M?"
+                } else {
+                    "S? M?"
+                }
+            } else if lower.contains("not replayed") {
+                if recovery {
+                    if width >= 9 {
+                        "I? NR M?r"
+                    } else {
+                        "NR M?r"
+                    }
+                } else if disconnected {
+                    if width >= 10 {
+                        "I? NR M? E"
+                    } else {
+                        "NR M? E"
+                    }
+                } else if leaving {
+                    if width >= 11 {
+                        "I? NR M? L? r"
+                    } else {
+                        "NR M? r"
+                    }
+                } else if width >= 10 {
+                    "No rep; M?"
+                } else {
+                    "NR M?"
+                }
+            } else if recovery {
+                "Mode? r"
+            } else if disconnected {
+                if width >= 11 {
+                    "Mode? Enter"
+                } else {
+                    "M? Enter"
+                }
+            } else if leaving {
+                if width >= 10 {
+                    "Mode? L? r"
+                } else {
+                    "M? r"
+                }
+            } else if width >= 11 {
+                "Paste mode?"
+            } else {
+                "Mode?"
+            }
+        } else if leaving && recovery {
+            if paste_body && paste_mode_uncertain {
+                if width >= 13 {
+                    "Part? M? L? r"
+                } else {
+                    "P? M? r"
+                }
+            } else if paste_open && paste_mode_uncertain {
+                if width >= 13 {
+                    "Open? M? L? r"
+                } else {
+                    "O? M? r"
+                }
+            } else if paste_close {
+                if width >= 13 {
+                    "Sent? M? L? r"
+                } else if width >= 10 {
+                    "S? M? L? r"
+                } else {
+                    "S? M? r"
+                }
+            } else if paste {
+                if width >= 12 {
+                    "P? L? r"
+                } else {
+                    "P? r"
+                }
+            } else if mouse {
+                if width >= 12 {
+                    "M? L? r"
+                } else {
+                    "M? r"
+                }
+            } else if width >= 12 {
+                "I? L? r"
+            } else {
+                "I? r"
+            }
+        } else if recovery {
+            if paste_body && paste_mode_uncertain {
+                if width >= 11 {
+                    "Part? M? r"
+                } else {
+                    "P? M? r"
+                }
+            } else if paste_open && paste_mode_uncertain {
+                if width >= 11 {
+                    "Open? M? r"
+                } else {
+                    "O? M? r"
+                }
+            } else if paste_body {
+                if width >= 9 {
+                    "Part? r"
+                } else {
+                    "P? r"
+                }
+            } else if paste_close {
+                if width >= 11 {
+                    "Sent? M? r"
+                } else {
+                    "S? M? r"
+                }
+            } else if paste_open {
+                if width >= 9 {
+                    "Open? r"
+                } else {
+                    "O? r"
+                }
+            } else if paste {
+                if width >= 9 {
+                    "Paste? r"
+                } else {
+                    "P? r"
+                }
+            } else if mouse {
+                if width >= 9 {
+                    "Mouse? r"
+                } else {
+                    "M? r"
+                }
+            } else if width >= 11 {
+                "Input? r"
+            } else {
+                "I? r"
+            }
+        } else if leaving {
+            if lower.contains("not replayed") {
+                if width >= 15 {
+                    "Input? Leave?"
+                } else {
+                    "I? L?"
+                }
+            } else if width >= 15 {
+                "Leave?/input?"
+            } else {
+                "Leave?"
+            }
+        } else if paste_body && paste_mode_uncertain && disconnected {
+            if width >= 11 {
+                "Part? M? E"
+            } else {
+                "P? M? E"
+            }
+        } else if paste_open && paste_mode_uncertain && disconnected {
+            if width >= 11 {
+                "Open? M? E"
+            } else {
+                "O? M? E"
+            }
+        } else if paste_close && disconnected {
+            if width >= 13 {
+                "Sent? Mode? E"
+            } else if width >= 11 {
+                "Sent? M? E"
+            } else {
+                "S? M? E"
+            }
+        } else if paste_body && disconnected {
+            if width >= 11 {
+                "Part? Enter"
+            } else {
+                "P? E"
+            }
+        } else if paste_open && disconnected {
+            if width >= 11 {
+                "Open? Enter"
+            } else {
+                "O? E"
+            }
+        } else if lower.contains("not replayed") && disconnected {
+            if width >= 16 {
+                "I? no rep; Enter"
+            } else if width >= 10 {
+                "I?; Enter"
+            } else {
+                "I? E"
+            }
+        } else if lower.contains("not replayed") {
+            if width >= 16 {
+                "Input? no replay"
+            } else if width >= 9 {
+                "I? no dup"
+            } else {
+                "I? dup?"
+            }
+        } else if disconnected {
+            if width >= 12 {
+                "Select+Enter"
+            } else {
+                "Enter"
+            }
+        } else if join_failed {
+            if width >= 12 {
+                "Join? input?"
+            } else {
+                "Join fail"
+            }
+        } else if lower.contains("port list unavailable") {
+            if width >= 14 {
+                "Ports? input?"
+            } else {
+                "Ports?"
+            }
+        } else if unavailable || other_failure {
+            if width >= 13 {
+                "Fail + input?"
+            } else {
+                "Fail?"
+            }
+        } else {
+            warning
+        };
+        return line.chars().take(width.max(1) as usize).collect();
+    }
+
+    if recovery
+        || leaving
+        || disconnected
+        || join_failed
+        || unavailable
+        || other_failure
+        || lower.contains("not replayed")
+        || paste_open
+        || paste_close
+        || paste_body
+        || paste_mode_uncertain
+    {
+        let combined = if let Some(count) = count {
+            format!("{warning} MCP{count}")
+        } else {
+            warning.to_owned()
+        };
+        let first = if combined.chars().count() <= width as usize {
+            combined
+        } else {
+            warning.to_owned()
+        };
+        let current_line = if paste_body && paste_mode_uncertain {
+            if recovery {
+                if no_replay && width >= 13 {
+                    "Rest? NR M? r"
+                } else if no_replay {
+                    "NR M?r"
+                } else if width >= 10 {
+                    "Rest? M? r"
+                } else {
+                    "M? r"
+                }
+            } else if disconnected {
+                if no_replay && width >= 13 {
+                    "Rest? NR M? E"
+                } else if no_replay {
+                    "NR M? E"
+                } else if width >= 14 {
+                    "Rest? M? Enter"
+                } else {
+                    "M? Enter"
+                }
+            } else if leaving {
+                if no_replay {
+                    "NR M? r"
+                } else if width >= 15 {
+                    "Unsent M? L? r"
+                } else {
+                    "M? L? r"
+                }
+            } else if no_replay {
+                if width >= 9 {
+                    "Rest? NR M?"
+                } else {
+                    "NR M?"
+                }
+            } else if width >= 14 {
+                "Rest unsent M?"
+            } else if width >= 9 {
+                "Unsent M?"
+            } else {
+                "Unsnt M?"
+            }
+        } else if paste_open && paste_mode_uncertain {
+            if recovery {
+                if width >= 13 {
+                    "No body; M? r"
+                } else {
+                    "M? r"
+                }
+            } else if disconnected {
+                if width >= 17 {
+                    "No body; M? Enter"
+                } else {
+                    "M? Enter"
+                }
+            } else if leaving {
+                if width >= 14 {
+                    "NoBody M? L? r"
+                } else {
+                    "M? L? r"
+                }
+            } else if width >= 9 {
+                "M? noBody"
+            } else {
+                "M?Nbody"
+            }
+        } else if paste_close && paste_mode_uncertain {
+            if recovery {
+                if width >= 10 {
+                    "Sent? M? r"
+                } else {
+                    "S? M? r"
+                }
+            } else if disconnected {
+                if width >= 14 {
+                    "Sent? M? Enter"
+                } else {
+                    "M? Enter"
+                }
+            } else if leaving {
+                if width >= 13 {
+                    "Sent? M? L? r"
+                } else {
+                    "M? L? r"
+                }
+            } else if width >= 11 {
+                "Paste mode?"
+            } else {
+                "Mode?"
+            }
+        } else if paste_mode_uncertain && lower.contains("not replayed") {
+            if recovery {
+                if width >= 12 {
+                    "No rep; M? r"
+                } else if width >= 9 {
+                    "NoRep M?r"
+                } else {
+                    "NR M?r"
+                }
+            } else if disconnected {
+                if width >= 12 {
+                    "No rep; M? E"
+                } else {
+                    "NR M? E"
+                }
+            } else if leaving {
+                if width >= 15 {
+                    "No rep; M? L? r"
+                } else {
+                    "NR M? r"
+                }
+            } else if width >= 13 {
+                "No replay; M?"
+            } else if width >= 9 {
+                "NoRep M?"
+            } else {
+                "NR M?"
+            }
+        } else if paste_mode_uncertain && recovery {
+            "Mode? r"
+        } else if paste_mode_uncertain && disconnected {
+            "M? Enter"
+        } else if paste_mode_uncertain && leaving {
+            if width >= 10 {
+                "Mode? L? r"
+            } else {
+                "M? r"
+            }
+        } else if paste_mode_uncertain {
+            "Paste mode?"
+        } else if paste_body {
+            if leaving {
+                if width >= 16 {
+                    "Rest unsent L? r"
+                } else if width >= 12 {
+                    "Rest? L? r"
+                } else if width >= 9 {
+                    "Rest L? r"
+                } else {
+                    "Rest r"
+                }
+            } else if disconnected {
+                if width >= 12 {
+                    "Rest; Enter"
+                } else {
+                    "Rest E"
+                }
+            } else if recovery {
+                if width >= 13 {
+                    "Rest? r retry"
+                } else {
+                    "Rest? r"
+                }
+            } else if width >= 11 {
+                "Rest unsent"
+            } else {
+                "Rest?"
+            }
+        } else if paste_open {
+            if recovery {
+                if width >= 10 {
+                    "No body r"
+                } else {
+                    "NoBody r"
+                }
+            } else if disconnected {
+                if width >= 11 {
+                    "No body; E"
+                } else {
+                    "NoBody E"
+                }
+            } else if leaving {
+                if width >= 12 {
+                    "No body; L? r"
+                } else {
+                    "NoBody r"
+                }
+            } else if width >= 13 {
+                "Body not sent"
+            } else if width >= 10 {
+                "No body"
+            } else {
+                "NoBody"
+            }
+        } else if paste_close {
+            if recovery {
+                "Mode? r"
+            } else if disconnected {
+                if width >= 11 {
+                    "Mode? Enter"
+                } else {
+                    "Mode? E"
+                }
+            } else if leaving {
+                if width >= 10 {
+                    "Mode? L? r"
+                } else {
+                    "Mode? r"
+                }
+            } else if width >= 11 {
+                "Paste mode?"
+            } else {
+                "Mode?"
+            }
+        } else if lower.contains("not replayed") {
+            if leaving {
+                if width >= 15 {
+                    "No replay; L? r"
+                } else if width >= 12 {
+                    "No dup; L? r"
+                } else {
+                    "No dup r"
+                }
+            } else if disconnected {
+                if width >= 16 {
+                    "No replay; Enter"
+                } else if width >= 13 {
+                    "No dup; Enter"
+                } else {
+                    "No dup E"
+                }
+            } else if recovery {
+                if width >= 12 {
+                    "No replay; r"
+                } else {
+                    "No dup r"
+                }
+            } else if width >= 9 {
+                "No replay"
+            } else {
+                "No dup"
+            }
+        } else if leaving {
+            "Leave? r"
+        } else if recovery {
+            if width < 12 {
+                "r retry"
+            } else {
+                "r reconnect"
+            }
+        } else if disconnected {
+            if width >= 15 {
+                "Enter reconnect"
+            } else if width >= 12 {
+                "Select+Enter"
+            } else {
+                "Enter"
+            }
+        } else if join_failed {
+            if width < 12 {
+                "Join fail"
+            } else {
+                "Join failed"
+            }
+        } else if lower.contains("port list unavailable") {
+            if width < 18 {
+                "Ports?"
+            } else {
+                "Ports unavailable"
+            }
+        } else if unavailable {
+            if width < 12 {
+                "Offline"
+            } else {
+                "Unavailable"
+            }
+        } else if width < 16 {
+            "Failed"
+        } else {
+            "Operation failed"
+        };
+        return format!("{first}\n{current_line}");
+    }
+
+    if let Some(count) = count {
+        let with_count = format!("{warning} MCP{count}");
+        if with_count.chars().count() <= width as usize {
+            return with_count;
+        }
+    }
+    warning.to_owned()
+}
+
+fn gap_prompt_header(
+    device: &Device,
+    count: &str,
+    status: &str,
+    width: u16,
+    available_rows: u16,
+) -> String {
+    if status_indicates_input_uncertainty(status) {
+        return input_warning_header(status, width, available_rows, Some(count));
+    }
+    let lower_status = status.to_ascii_lowercase();
+    let subscription_failure = lower_status.contains("subscription failed");
+    let disconnected = lower_status.contains("device disconnected");
+    let recovery = status.contains("r reconnects")
+        || status.contains("Daemon unavailable")
+        || status.contains("Daemon shutting down")
+        || subscription_failure;
+    let leave_uncertain = lower_status.contains("leave outcome unknown");
+    let compact_status = if subscription_failure {
+        if width < 12 {
+            "Sub+r"
+        } else {
+            "Sub fail · r"
+        }
+    } else if leave_uncertain {
+        "Leave? r"
+    } else if recovery {
+        if width < 12 {
+            "r retry"
+        } else {
+            "r reconnect"
+        }
+    } else if status.starts_with("Join failed") {
+        if width < 9 {
+            "Join?"
+        } else if width < 12 {
+            "Join fail"
+        } else {
+            "Join failed"
+        }
+    } else if disconnected {
+        if width >= 15 {
+            "Enter reconnect"
+        } else if width >= 12 {
+            "Select+Enter"
+        } else {
+            "Enter"
+        }
+    } else if status.contains("unavailable") {
+        if width < 12 {
+            "Offline"
+        } else {
+            "Unavailable"
+        }
+    } else if status.contains("failed") {
+        "Failed"
+    } else if status.contains("incomplete") || status.contains("overflow") {
+        "Incomplete"
+    } else if status.starts_with("Connected") && device.joined {
+        "Connected"
+    } else if device.state == "disconnected" {
+        if width < 12 {
+            "Offline"
+        } else {
+            "Disconnected"
+        }
+    } else if !device.joined && device.state == "connected" {
+        "Not joined"
+    } else {
+        "Available"
+    };
+
+    if available_rows == 1 {
+        let one_line = if subscription_failure {
+            format!("Sub+r MCP{count}")
+        } else if leave_uncertain {
+            "Leave? r".to_owned()
+        } else if recovery {
+            format!("r MCP{count}")
+        } else if status.starts_with("Join failed")
+            || status.starts_with("Device disconnected")
+            || status.contains("unavailable")
+        {
+            compact_status.to_owned()
+        } else {
+            format!("GAP MCP{count}")
+        };
+        return one_line.chars().take(width.max(1) as usize).collect();
+    }
+
+    if width >= 64 && available_rows >= 3 {
+        let action = if recovery || leave_uncertain {
+            " · r reconnects"
+        } else if disconnected {
+            " · select device, Enter reconnects"
+        } else {
+            ""
+        };
+        let full = format!(
+            "OUTPUT GAP · MCP clients: {count} · {status} · {} · {} baud · control {}{action}",
+            device.state, device.baud, device.control
+        );
+        if wrapped_rows(&full, width) <= available_rows {
+            return full;
+        }
+    }
+
+    let with_baud = format!("GAP MCP{count} {}", device.baud);
+    let count_only = format!("GAP MCP{count}");
+    let first_line = if with_baud.chars().count() <= width as usize {
+        with_baud
+    } else if count_only.chars().count() <= width as usize {
+        count_only
+    } else {
+        format!("MCP{count}").chars().take(width as usize).collect()
+    };
+    format!("{first_line}\n{compact_status}")
+}
+
+fn push_baud_digit(value: &mut String, digit: char) -> bool {
+    if digit.is_ascii_digit() && value.len() < 7 {
+        value.push(digit);
+        true
+    } else {
+        false
+    }
+}
+
+fn baud_dialog_supported(width: u16, height: u16) -> bool {
+    width >= 16 && height >= 5
+}
+
+fn vt_screen_width(term_width: u16) -> u16 {
+    let sidebar_width = if term_width < 64 { 0 } else { 28 };
+    term_width
+        .saturating_sub(sidebar_width)
+        .saturating_sub(2)
+        .max(1)
+}
+
+fn sidebar_hit_target(
+    row: u16,
+    pane_top: u16,
+    sidebar_offset: usize,
+    visible_rows: usize,
+    device_count: usize,
+) -> Option<usize> {
+    let row_offset = usize::from(row.checked_sub(pane_top)?);
+    if row_offset >= visible_rows {
+        return None;
+    }
+    let target = sidebar_offset.saturating_add(row_offset);
+    (target < device_count).then_some(target)
+}
+
+fn fitting_prompt(candidates: &[String], width: u16, height: u16) -> Option<String> {
     candidates
         .iter()
-        .min_by_key(|candidate| candidate.chars().count())
-        .map(|candidate| candidate.chars().take(width.max(1) as usize).collect())
-        .unwrap_or_default()
+        .find(|candidate| wrapped_rows(candidate, width) <= height)
+        .cloned()
 }
 
 fn to_color(color: vt100::Color) -> TColor {
@@ -1354,6 +2765,41 @@ mod tests {
     }
 
     #[test]
+    fn leave_failure_is_reported_without_claiming_local_departure() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let mut client = Client {
+            stream,
+            reader,
+            id: 0,
+            events: VecDeque::new(),
+            overflow: false,
+        };
+        let server = std::thread::spawn(move || {
+            let mut peer_reader = BufReader::new(peer.try_clone().unwrap());
+            for (expected_id, ok) in [(1, true), (2, false)] {
+                let mut line = String::new();
+                peer_reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["id"], expected_id);
+                let response = if ok {
+                    json!({"v": V, "id": expected_id, "ok": true, "result": {}})
+                } else {
+                    json!({"v": V, "id": expected_id, "ok": false, "error": {"message": "synthetic leave rejection"}})
+                };
+                peer.write_all(format!("{response}\n").as_bytes()).unwrap();
+            }
+        });
+        let mut device = test_device("synthetic-device".into());
+        device.joined = true;
+        assert!(client.leave_device(&mut device).is_err());
+        assert!(device.joined);
+        assert!(!device.gap);
+        client.close();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn terminal_escape_sequences_are_confined_to_the_vt_buffer() {
         let mut parser = vt100::Parser::new(24, 80, SCROLLBACK);
         parser.process(b"before\x1b[2J\x1b[Hafter");
@@ -1414,6 +2860,15 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_hit_testing_ignores_unrendered_rows() {
+        assert_eq!(sidebar_hit_target(3, 3, 0, 10, 1), Some(0));
+        assert_eq!(sidebar_hit_target(4, 3, 0, 10, 1), None);
+        assert_eq!(sidebar_hit_target(2, 3, 0, 10, 1), None);
+        assert_eq!(sidebar_hit_target(8, 3, 0, 4, 10), None);
+        assert_eq!(sidebar_hit_target(5, 3, 4, 4, 10), Some(6));
+    }
+
+    #[test]
     fn baud_prompt_can_use_every_row_without_reserving_a_pane() {
         let area = ratatui::layout::Rect::new(0, 0, 18, 5);
         let rows = Layout::default()
@@ -1428,6 +2883,382 @@ mod tests {
     }
 
     #[test]
+    fn gap_header_prioritizes_status_and_client_count_on_small_screens() {
+        let device = Device {
+            state: "connected".into(),
+            baud: "115200".into(),
+            control: "available".into(),
+            ..Device::default()
+        };
+
+        let header = gap_prompt_header(
+            &device,
+            "3",
+            "Daemon unavailable · r reconnects · cached screens retained",
+            16,
+            2,
+        );
+        assert_eq!(header, "GAP MCP3 115200\nr reconnect");
+        assert_eq!(prompt_header_height(&header, 16, 5), 2);
+        assert_eq!(
+            prompt_header_height(&header, 16, 5).min(5_u16.saturating_sub(3).max(1)),
+            2
+        );
+        assert_eq!(
+            gap_prompt_header(
+                &device,
+                "3",
+                "Daemon shutting down · cached screens retained",
+                32,
+                2,
+            ),
+            "GAP MCP3 115200\nr reconnect"
+        );
+        assert_eq!(
+            gap_prompt_header(&device, "3", "Input outcome unknown; not replayed", 16, 2,),
+            "Input? unknown\nNo replay"
+        );
+        assert_eq!(
+            gap_prompt_header(&device, "3", "Input outcome unknown; not replayed", 16, 1,),
+            "Input? no replay"
+        );
+        assert_eq!(
+            gap_prompt_header(&device, "3", "Daemon unavailable · r reconnects", 16, 1),
+            "r MCP3"
+        );
+        assert_eq!(
+            gap_prompt_header(
+                &device,
+                "3",
+                "Input outcome unknown; not replayed · Device disconnected",
+                16,
+                2,
+            ),
+            "Input? unknown\nNo replay; Enter"
+        );
+        assert_eq!(
+            gap_prompt_header(
+                &device,
+                "3",
+                "Input outcome unknown; not replayed · Daemon unavailable · r reconnects",
+                16,
+                2,
+            ),
+            "Input? unknown\nNo replay; r"
+        );
+        assert_eq!(
+            gap_prompt_header(
+                &device,
+                "3",
+                "Paste outcome unknown; remaining bytes were not sent",
+                16,
+                2,
+            ),
+            "Partial? MCP3\nRest unsent"
+        );
+        assert_eq!(
+            gap_prompt_header(
+                &device,
+                "3",
+                "Mouse input outcome unknown; not replayed",
+                16,
+                2,
+            ),
+            "Mouse? unknown\nNo replay"
+        );
+        assert_eq!(
+            input_warning_header(
+                "Input outcome unknown; not replayed · Port list unavailable · cached tabs",
+                16,
+                2,
+                None,
+            ),
+            "Input? unknown\nNo replay"
+        );
+        assert_eq!(
+            recovery_prompt_header(
+                "Input outcome unknown; not replayed · daemon unavailable · r reconnects",
+                16,
+                2,
+            ),
+            "Input? unknown\nNo replay; r"
+        );
+        assert_eq!(
+            recovery_prompt_header(
+                "Input outcome unknown; not replayed · daemon unavailable · r reconnects",
+                16,
+                1,
+            ),
+            "Input? r"
+        );
+        assert_eq!(
+            recovery_prompt_header("daemon unavailable", 16, 1),
+            "D lost r"
+        );
+        assert_eq!(
+            recovery_prompt_header("daemon unavailable", 16, 2),
+            "Daemon lost\nr reconnect"
+        );
+        assert_eq!(
+            recovery_prompt_header("subscription failed", 16, 2),
+            "Subscribe failed\nr reconnect"
+        );
+        assert_eq!(
+            recovery_prompt_header("leave outcome unknown", 16, 2),
+            "Leave uncertain\nr reconnect"
+        );
+        let tiny_warning = input_warning_header(
+            "Paste outcome unknown; remaining bytes were not sent · Daemon unavailable · r reconnects",
+            8,
+            2,
+            None,
+        );
+        assert_eq!(tiny_warning, "Partial?\nRest? r");
+        assert_eq!(wrapped_rows(&tiny_warning, 8), 2);
+        let paste_warning = "Paste outcome unknown; remaining bytes were not sent";
+        assert_eq!(
+            input_warning_header(paste_warning, 80, 12, None),
+            paste_warning
+        );
+        assert_eq!(
+            input_warning_header(
+                "Input outcome unknown; not replayed · Join failed",
+                16,
+                2,
+                None,
+            ),
+            "Input? unknown\nNo replay"
+        );
+        assert_eq!(
+            gap_prompt_header(
+                &device,
+                "3",
+                "Device disconnected · select and press Enter to reconnect",
+                16,
+                2,
+            ),
+            "GAP MCP3 115200\nEnter reconnect"
+        );
+        assert_eq!(
+            gap_prompt_header(
+                &device,
+                "3",
+                "Output subscription failed; connection closed for cleanup",
+                16,
+                2,
+            ),
+            "GAP MCP3 115200\nSub fail · r"
+        );
+        assert_eq!(
+            recovery_prompt_header(
+                "Leave outcome unknown; connection closed for cleanup; r reconnects",
+                16,
+                2,
+            ),
+            "Leave uncertain\nr reconnect"
+        );
+        let combined = "Paste outcome unknown; remaining bytes were not sent · Leave outcome unknown; connection closed for cleanup; r reconnects";
+        assert!(status_indicates_input_uncertainty(combined));
+        assert_eq!(
+            input_warning_header(combined, 16, 2, None),
+            "Partial?\nRest unsent L? r"
+        );
+        let body_cleanup_unknown = "Paste body chunk outcome unknown; remaining bytes were not sent; closing delimiter outcome unknown; application may remain in paste mode · Daemon unavailable · r reconnects";
+        assert_eq!(
+            input_warning_header(body_cleanup_unknown, 16, 2, None),
+            "Partial?\nRest? NR M? r"
+        );
+        assert_eq!(
+            input_warning_header(body_cleanup_unknown, 12, 1, None),
+            "P? NR M?r"
+        );
+        assert_eq!(
+            input_warning_header(
+                "Paste opening delimiter outcome unknown; closing delimiter outcome unknown; application may remain in paste mode",
+                16,
+                2,
+                None,
+            ),
+            "Open? unknown\nM? noBody"
+        );
+        assert_eq!(
+            input_warning_header(
+                "Paste body sent; closing delimiter outcome unknown; application may remain in paste mode",
+                16,
+                2,
+                None,
+            ),
+            "Body sent\nPaste mode?"
+        );
+        assert_eq!(
+            input_warning_header(
+                "Paste body sent; closing delimiter outcome unknown; application may remain in paste mode",
+                16,
+                1,
+                None,
+            ),
+            "Body sent; mode?"
+        );
+        assert_eq!(
+            input_warning_header(
+                "Paste opening delimiter outcome unknown; closing delimiter outcome unknown; application may remain in paste mode",
+                16,
+                1,
+                None,
+            ),
+            "Open? M?"
+        );
+        assert_eq!(
+            input_warning_header(
+                "Paste body chunk outcome unknown; remaining bytes were not sent; closing delimiter outcome unknown; application may remain in paste mode",
+                16,
+                1,
+                None,
+            ),
+            "P? NR M?"
+        );
+        assert_eq!(
+            input_warning_header(
+                "Input outcome unknown; not replayed · Paste mode outcome unknown; application may remain in paste mode · Daemon unavailable · r reconnects",
+                16,
+                2,
+                None,
+            ),
+            "Input? unknown\nNo rep; M? r"
+        );
+        let unresolved_body = "Paste body chunk outcome unknown; remaining bytes were not sent; closing delimiter outcome unknown; application may remain in paste mode";
+        let resolved_mode = resolve_paste_mode_warning(unresolved_body);
+        assert!(resolved_mode.contains("Paste body chunk outcome unknown"));
+        assert!(resolved_mode.contains("remaining bytes were not sent"));
+        assert!(resolved_mode.contains("closing delimiter was later sent"));
+        assert!(!resolved_mode.contains("application may remain in paste mode"));
+        for width in 8..=15 {
+            for rows in 1..=2 {
+                let headers = [
+                    input_warning_header(
+                        "Paste body chunk outcome unknown; remaining bytes were not sent · Daemon unavailable · r reconnects",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Input outcome unknown; not replayed · Device disconnected",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Paste body chunk outcome unknown; remaining bytes were not sent · Device disconnected",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Paste body sent; closing delimiter outcome unknown; application may remain in paste mode",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Paste opening delimiter outcome unknown; closing delimiter outcome unknown; application may remain in paste mode · Daemon unavailable · r reconnects",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Paste body chunk outcome unknown; remaining bytes were not sent; closing delimiter outcome unknown; application may remain in paste mode · Device disconnected",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Paste body sent; closing delimiter outcome unknown; application may remain in paste mode · Device disconnected",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Input outcome unknown; not replayed · Paste mode outcome unknown; application may remain in paste mode · Daemon unavailable · r reconnects",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Input outcome unknown; not replayed · Paste mode outcome unknown; application may remain in paste mode · Device disconnected",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    input_warning_header(
+                        "Input outcome unknown; not replayed · Paste body chunk outcome unknown; remaining bytes were not sent; closing delimiter outcome unknown; application may remain in paste mode · Daemon unavailable · r reconnects",
+                        width,
+                        rows,
+                        None,
+                    ),
+                    recovery_prompt_header("Daemon unavailable", width, rows),
+                    recovery_prompt_header("Leave outcome unknown", width, rows),
+                    recovery_prompt_header("Output subscription failed", width, rows),
+                    gap_prompt_header(&device, "3", "Join failed", width, rows),
+                    gap_prompt_header(
+                        &device,
+                        "3",
+                        "Device disconnected · select and press Enter to reconnect",
+                        width,
+                        rows,
+                    ),
+                ];
+                for header in headers {
+                    assert!(
+                        header.lines().count() <= usize::from(rows),
+                        "header exceeded {rows} rows at width {width}: {header:?}"
+                    );
+                    assert!(
+                        header
+                            .lines()
+                            .all(|line| line.chars().count() <= usize::from(width)),
+                        "header exceeded width {width}: {header:?}"
+                    );
+                }
+                for status in [
+                    "Input outcome unknown; not replayed · Paste mode outcome unknown; application may remain in paste mode · Daemon unavailable · r reconnects",
+                    "Input outcome unknown; not replayed · Paste mode outcome unknown; application may remain in paste mode · Device disconnected",
+                    "Input outcome unknown; not replayed · Paste body chunk outcome unknown; remaining bytes were not sent; closing delimiter outcome unknown; application may remain in paste mode · Daemon unavailable · r reconnects",
+                ] {
+                    let header = input_warning_header(status, width, rows, None);
+                    let last_line = header.lines().last().unwrap_or_default();
+                    assert!(
+                        header.contains("M?"),
+                        "paste-mode uncertainty missing at width {width}, rows {rows}: {header:?}"
+                    );
+                    assert!(
+                        ["NR", "NoRep", "No rep", "No replay"]
+                            .iter()
+                            .any(|marker| header.contains(marker)),
+                        "no-replay warning missing at width {width}, rows {rows}: {header:?}"
+                    );
+                    if status.contains("reconnects") {
+                        assert!(last_line.ends_with('r'), "retry action missing: {header:?}");
+                    } else {
+                        assert!(
+                            last_line.ends_with('E') || last_line.ends_with("Enter"),
+                            "reconnect action missing: {header:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            input_warning_header(
+                "Input outcome unknown; not replayed · Device disconnected",
+                16,
+                1,
+                None,
+            ),
+            "I? no rep; Enter"
+        );
+    }
+
+    #[test]
     fn baud_prompt_header_reserves_rows_for_wrapped_text() {
         let confirmation =
             " serial-mcp · MCP clients: 1\n Shared baud affects all clients. Confirm y/n";
@@ -1438,7 +3269,7 @@ mod tests {
         let compact_prompt = "MCP1\nBaud:4000000\nRange 1-4000000\nEnter=apply\nEsc=cancel";
         let tiny_confirmation = "Shared baud? y/n";
         let tiny_prompt = "Baud 4000000 Enter apply/Esc cancel";
-        let minimum_prompt = "E/Esc 4000000";
+        let minimum_prompt = "4000000 Enter apply/Esc cancel";
         let minimum_confirmation = "y/n";
         let short_prompt = "Baud:4000000\n1-4000000\nEnter apply/Esc cancel";
         let confirmation_candidates = vec![
@@ -1472,18 +3303,33 @@ mod tests {
         assert_eq!(wrapped_rows(tiny_prompt, 18), 2);
         assert_eq!(wrapped_rows(short_prompt, 18), 4);
         assert_eq!(prompt_header_height(short_prompt, 18, 4), 4);
-        assert_eq!(fitting_prompt(&baud_candidates, 24, 4), short_prompt);
+        assert_eq!(
+            fitting_prompt(&baud_candidates, 24, 4),
+            Some(short_prompt.to_owned())
+        );
         assert_eq!(
             fitting_prompt(&confirmation_candidates, 10, 4),
-            tiny_confirmation
+            Some(tiny_confirmation.to_owned())
         );
-        assert!(wrapped_rows(&fitting_prompt(&baud_candidates, 10, 4), 10) <= 4);
         assert_eq!(
             fitting_prompt(&confirmation_candidates, 10, 1),
-            minimum_confirmation
+            Some(minimum_confirmation.to_owned())
         );
-        assert!(wrapped_rows(&fitting_prompt(&confirmation_candidates, 10, 1), 10) <= 1);
-        assert!(!fitting_prompt(&baud_candidates, 10, 1).is_empty());
+        assert_eq!(fitting_prompt(&baud_candidates, 10, 1), None);
+        assert_eq!(
+            fitting_prompt(&baud_candidates, 16, 5),
+            Some(compact_prompt.to_owned())
+        );
+        assert!(baud_dialog_supported(16, 5));
+        assert!(!baud_dialog_supported(10, 1));
+        assert_eq!(vt_screen_width(50), 48);
+        assert_eq!(vt_screen_width(100), 70);
+        let mut digits = String::new();
+        for digit in "0000000".chars() {
+            assert!(push_baud_digit(&mut digits, digit));
+        }
+        assert!(!push_baud_digit(&mut digits, '9'));
+        assert_eq!(digits, "0000000");
         assert_eq!(prompt_header_height(confirmation, 18, 1), 1);
     }
 
