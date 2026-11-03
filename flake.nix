@@ -44,7 +44,7 @@
             cp ${rustClient}/bin/serial-mcp-rust-client $out/bin/serial-mcp
             cp ${rustClient}/bin/serial-mcp-terminal $out/bin/serial-mcp-terminal
             wrapProgram $out/bin/serial-mcp-terminal \
-              --prefix PATH : $out/bin:${pythonEnv}/bin \
+              --prefix PATH : $out/bin:${pythonEnv}/bin:${pkgs.psmisc}/bin \
               --prefix PYTHONPATH : $out/share/serial-mcp
             chmod +x $out/bin/serial-mcp
             # serial-mcp-legacy is the previous in-process server (one device per MCP process).
@@ -53,14 +53,15 @@
 
             # The native frontend needs the Python daemon on PATH/PYTHONPATH only when starting it.
             wrapProgram $out/bin/serial-mcp \
-              --prefix PATH : ${pythonEnv}/bin \
+              --prefix PATH : ${pythonEnv}/bin:${pkgs.psmisc}/bin \
               --prefix PYTHONPATH : $out/share/serial-mcp
             wrapProgram $out/bin/serial-mcp-legacy \
-              --prefix PATH : ${pythonEnv}/bin \
+              --prefix PATH : ${pythonEnv}/bin:${pkgs.psmisc}/bin \
               --prefix PYTHONPATH : $out/share/serial-mcp
 
             makeWrapper ${pythonEnv}/bin/python3 $out/bin/serial-mcp-daemon \
               --add-flags "-m serial_mcp_daemon" \
+              --prefix PATH : ${pkgs.psmisc}/bin \
               --prefix PYTHONPATH : $out/share/serial-mcp
 
           '';
