@@ -190,6 +190,7 @@ struct Device {
     selecting: bool,
     joined: bool,
     gap_acknowledged: bool,
+    screen_width: u16,
     input_warning: Option<String>,
     paste_mode_uncertain: bool,
 }
@@ -204,7 +205,7 @@ impl Device {
             control: "available".into(),
             screen: vt100::Parser::new(
                 rows.saturating_sub(4).max(1),
-                vt_screen_width(cols, false),
+                vt_screen_width(cols),
                 SCROLLBACK,
             ),
             gap: false,
@@ -213,11 +214,72 @@ impl Device {
             selecting: false,
             joined: false,
             gap_acknowledged: false,
+            screen_width: vt_screen_width(cols),
             input_warning: None,
             paste_mode_uncertain: false,
         }
     }
 }
+/// Release the membership of the device that is not the one being opened.
+///
+/// Returns false when the leave failed; the caller then stops, because the
+/// daemon's answer is unknown and `active` must not keep naming a device the
+/// TUI is no longer a member of. On success `active` is cleared before the new
+/// join is attempted, so a failed join leaves a consistent sidebar-only state.
+#[allow(clippy::too_many_arguments)]
+fn release_previous_membership(
+    c: &mut Client,
+    devs: &mut [Device],
+    active: &mut Option<usize>,
+    keep: usize,
+    daemon_lost: &mut bool,
+    leave_outcome_unknown: &mut bool,
+    operation_failure: &mut Option<String>,
+    status: &mut String,
+) -> bool {
+    let Some(previous) = active.filter(|&previous| previous != keep) else {
+        return true;
+    };
+    if let Err(error) = c.leave_device(&mut devs[previous]) {
+        c.close();
+        *daemon_lost = true;
+        *leave_outcome_unknown = true;
+        devs[previous].joined = false;
+        record_gap(&mut devs[previous]);
+        *active = None;
+        let failure = leave_failure_status(&error);
+        *operation_failure = Some(failure.clone());
+        *status = failure;
+        return false;
+    }
+    *active = None;
+    true
+}
+
+/// The width the cached screen should track, or `None` to leave it alone.
+///
+/// The buffer must match the pane it is rendered into: vt100 stores cells and
+/// wraps at the width it was given, so a wider buffer than the pane hides new
+/// output past the right edge, and a narrower one clips text the pane could
+/// show. The one case that must not resize is a narrow terminal whose pane is
+/// hidden behind the full-width drawer: shrinking then would truncate cells
+/// vt100 cannot restore, losing cached output with no gap to show for it.
+fn layout_screen_width(term_width: u16, focus_pane: bool, pane_hidden_drawer: bool) -> Option<u16> {
+    if pane_hidden_drawer && !focus_pane {
+        None
+    } else {
+        Some(vt_screen_width(term_width))
+    }
+}
+
+fn fit_cached_screen(device: &mut Device, rows: u16, width: u16) {
+    device.screen_width = width.max(1);
+    device
+        .screen
+        .screen_mut()
+        .set_size(rows.max(1), device.screen_width);
+}
+
 fn record_gap(device: &mut Device) {
     device.gap = true;
     device.gap_acknowledged = false;
@@ -381,10 +443,9 @@ fn run() -> Result<(), String> {
             }
             if let Some(i) = active {
                 let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-                devs[i].screen.screen_mut().set_size(
-                    height.saturating_sub(4).max(1),
-                    vt_screen_width(width, focus_pane),
-                );
+                if let Some(screen_width) = layout_screen_width(width, focus_pane, width < 64) {
+                    fit_cached_screen(&mut devs[i], height.saturating_sub(4).max(1), screen_width);
+                }
             }
             let preserve_failure = leave_outcome_unknown || subscription_failed;
             let mut snapshot_ports = HashSet::new();
@@ -678,42 +739,19 @@ fn run() -> Result<(), String> {
                     " · Paste mode outcome unknown; application may remain in paste mode",
                 );
             }
-            let prompt_header = if leave_outcome_unknown {
+            let recovery_input_blocked =
+                daemon_lost || leave_outcome_unknown || subscription_failed;
+            let prompt_header = if recovery_input_blocked {
                 Some(gap_device.map_or_else(
                     || recovery_prompt_header(&display_status, term_width, gap_header_rows),
                     |i| {
-                        gap_prompt_header(
+                        gap_prompt_header_for(
                             &devs[i],
                             &count,
                             &display_status,
                             term_width,
                             gap_header_rows,
-                        )
-                    },
-                ))
-            } else if subscription_failed {
-                Some(gap_device.map_or_else(
-                    || recovery_prompt_header(&display_status, term_width, gap_header_rows),
-                    |i| {
-                        gap_prompt_header(
-                            &devs[i],
-                            &count,
-                            &display_status,
-                            term_width,
-                            gap_header_rows,
-                        )
-                    },
-                ))
-            } else if daemon_lost {
-                Some(gap_device.map_or_else(
-                    || recovery_prompt_header(&display_status, term_width, gap_header_rows),
-                    |i| {
-                        gap_prompt_header(
-                            &devs[i],
-                            &count,
-                            &display_status,
-                            term_width,
-                            gap_header_rows,
+                            false,
                         )
                     },
                 ))
@@ -757,12 +795,13 @@ fn run() -> Result<(), String> {
                 })
             } else {
                 gap_device.map(|i| {
-                    gap_prompt_header(
+                    gap_prompt_header_for(
                         &devs[i],
                         &count,
                         &display_status,
                         term_width,
                         gap_header_rows,
+                        !focus_pane && !recovery_input_blocked,
                     )
                 })
             };
@@ -791,10 +830,9 @@ fn run() -> Result<(), String> {
             let screen_row_offset = screen_rows.saturating_sub(pane_height);
             let sidebar_offset = selected.saturating_add(1).saturating_sub(visible_devices);
             if let Some(i) = active {
-                devs[i]
-                    .screen
-                    .screen_mut()
-                    .set_size(screen_rows, vt_screen_width(term_width, pane_visible));
+                if let Some(screen_width) = layout_screen_width(term_width, focus_pane, narrow) {
+                    fit_cached_screen(&mut devs[i], screen_rows, screen_width);
+                }
             }
             term.draw(|f| {
                 let size = f.area();
@@ -812,7 +850,7 @@ fn run() -> Result<(), String> {
                 let device_status = status_device
                     .map(|i| {
                         let marker = if devs[i].gap {
-                            "OUTPUT GAP · a acknowledges"
+                            "OUTPUT GAP"
                         } else if devs[i].gap_acknowledged {
                             "gap acknowledged; lost output not recovered"
                         } else if devs[i].new_output {
@@ -880,9 +918,9 @@ fn run() -> Result<(), String> {
                     List::new(items).block(
                         Block::default()
                             .title(if focus_pane && active.is_some() {
-                                " Devices · Ctrl-] focuses · a Ack gap · d Disconnect "
+                                " Devices · a ack · Ctrl-] "
                             } else {
-                                " Devices · FOCUS · Enter open · a Ack gap · d Disconnect · q quit "
+                                " Devices · FOCUS · a ack · d del "
                             })
                             .borders(Borders::ALL),
                     ),
@@ -995,10 +1033,15 @@ fn run() -> Result<(), String> {
                             status = "Ready".into();
                         }
                         if let Some(i) = active {
-                            devs[i].screen.screen_mut().set_size(
-                                rows.saturating_sub(4).max(1),
-                                vt_screen_width(cols, pane_visible),
-                            );
+                            if let Some(screen_width) =
+                                layout_screen_width(cols, focus_pane, cols < 64)
+                            {
+                                fit_cached_screen(
+                                    &mut devs[i],
+                                    rows.saturating_sub(4).max(1),
+                                    screen_width,
+                                );
+                            }
                         }
                     }
                     Event::Key(k) if k.code == KeyCode::Char('q') && !(active.is_some() && focus_pane) => break,
@@ -1086,22 +1129,6 @@ fn run() -> Result<(), String> {
                                 };
                                 let changing=std::mem::take(&mut baud_change_pending);
                                 let raw = baud_prompt.take().unwrap();
-                                if !changing {
-                                    if let Some(previous) = active.filter(|&previous| previous != i) {
-                                        if let Err(error) = c.leave_device(&mut devs[previous]) {
-                                            c.close();
-                                            daemon_lost = true;
-                                            leave_outcome_unknown = true;
-                                            devs[previous].joined = false;
-                                            record_gap(&mut devs[previous]);
-                                            active = None;
-                                            let failure = leave_failure_status(&error);
-                                            operation_failure = Some(failure.clone());
-                                            status = failure;
-                                            continue;
-                                        }
-                                    }
-                                }
                                 match raw.parse::<u32>() {
                                     Ok(baud) if (1..=4_000_000).contains(&baud) => {
                                         if changing {
@@ -1110,6 +1137,18 @@ fn run() -> Result<(), String> {
                                                 Err(e)=>status=format!("Baud change failed: {e}")
                                             }
                                         } else {
+                                            if !release_previous_membership(
+                                                &mut c,
+                                                &mut devs,
+                                                &mut active,
+                                                i,
+                                                &mut daemon_lost,
+                                                &mut leave_outcome_unknown,
+                                                &mut operation_failure,
+                                                &mut status,
+                                            ) {
+                                                continue;
+                                            }
                                             match c.req(json!({"op":"join","port":devs[i].port,"baudrate":baud})) {
                                                 Ok(joined) => {
                                                     devs[i].device_id=joined["device_id"].as_str().map(str::to_owned);
@@ -1194,21 +1233,16 @@ fn run() -> Result<(), String> {
                                 literal_next = false;
                                 status = "Pane focus · Ctrl-] returns to sidebar".into();
                             } else if devs[i].state == "connected" {
-                                let previous = active.filter(|&previous| previous != i);
-                                let leave_error = previous.and_then(|previous| {
-                                    c.leave_device(&mut devs[previous]).err()
-                                });
-                                if let Some(error) = leave_error {
-                                    c.close();
-                                    daemon_lost = true;
-                                    leave_outcome_unknown = true;
-                                    let previous_device = previous.unwrap_or(i);
-                                    devs[previous_device].joined = false;
-                                    record_gap(&mut devs[previous_device]);
-                                    active = None;
-                                    let failure = leave_failure_status(&error);
-                                    operation_failure = Some(failure.clone());
-                                    status = failure;
+                                if !release_previous_membership(
+                                    &mut c,
+                                    &mut devs,
+                                    &mut active,
+                                    i,
+                                    &mut daemon_lost,
+                                    &mut leave_outcome_unknown,
+                                    &mut operation_failure,
+                                    &mut status,
+                                ) {
                                     continue;
                                 }
                                 match c.req(json!({"op":"join","port":devs[i].port})) {
@@ -1459,7 +1493,7 @@ fn run() -> Result<(), String> {
                         if let Some(i)=active { if devs[i].selecting { if let Some((start,_))=devs[i].selection {let pos=(m.row.saturating_sub(pane_content_top).saturating_add(screen_row_offset),m.column.saturating_sub(sidebar_width+1));devs[i].selection=Some((start,pos));} } }
                     }
                     Event::Mouse(m) if active.is_some() && m.kind==MouseEventKind::Up(crossterm::event::MouseButton::Left) => {if let Some(i)=active{devs[i].selecting=false;}}
-                    Event::Mouse(m) if active.is_some() && pane_height > 0 && m.column>=sidebar_width && m.kind == MouseEventKind::ScrollUp => {
+                    Event::Mouse(m) if active.is_some() && focus_pane && pane_height > 0 && m.column>=sidebar_width && m.kind == MouseEventKind::ScrollUp => {
                         if let Some(i) = active {
                             let s = devs[i].screen.screen_mut();
                             let n = s.scrollback();
@@ -1467,7 +1501,7 @@ fn run() -> Result<(), String> {
                             devs[i].new_output = true;
                         }
                     }
-                    Event::Mouse(m) if active.is_some() && pane_height > 0 && m.column>=sidebar_width && m.kind == MouseEventKind::ScrollDown => {
+                    Event::Mouse(m) if active.is_some() && focus_pane && pane_height > 0 && m.column>=sidebar_width && m.kind == MouseEventKind::ScrollDown => {
                         if let Some(i) = active {
                             let s = devs[i].screen.screen_mut();
                             let n = s.scrollback();
@@ -2515,12 +2549,15 @@ fn input_warning_header(
     warning.to_owned()
 }
 
-fn gap_prompt_header(
+/// `ack_available` is false when `a` would not acknowledge right now: the pane
+/// holds focus, so the key goes to the device, or recovery still blocks input.
+fn gap_prompt_header_for(
     device: &Device,
     count: &str,
     status: &str,
     width: u16,
     available_rows: u16,
+    ack_available: bool,
 ) -> String {
     if status_indicates_input_uncertainty(status) {
         return input_warning_header(status, width, available_rows, Some(count));
@@ -2599,19 +2636,28 @@ fn gap_prompt_header(
             || status.contains("unavailable")
         {
             compact_status.to_owned()
-        } else {
+        } else if !ack_available {
             format!("GAP MCP{count}")
+        } else if width >= 14 {
+            format!("GAP a=ack MCP{count}")
+        } else {
+            "GAP a:ack".to_owned()
         };
         return one_line.chars().take(width.max(1) as usize).collect();
     }
 
     if width >= 64 && available_rows >= 3 {
-        let action = if recovery || leave_uncertain {
-            " · r reconnects"
-        } else if disconnected {
-            " · select device, Enter reconnects"
+        let ack = if ack_available {
+            " · a acknowledges"
         } else {
             ""
+        };
+        let action = if recovery || leave_uncertain {
+            format!(" · r reconnects{ack}")
+        } else if disconnected {
+            format!(" · select device, Enter reconnects{ack}")
+        } else {
+            ack.to_owned()
         };
         let full = format!(
             "OUTPUT GAP · MCP clients: {count} · {status} · {} · {} baud · control {}{action}",
@@ -2622,15 +2668,26 @@ fn gap_prompt_header(
         }
     }
 
-    let with_baud = format!("GAP MCP{count} {}", device.baud);
-    let count_only = format!("GAP MCP{count}");
-    let first_line = if with_baud.chars().count() <= width as usize {
-        with_baud
-    } else if count_only.chars().count() <= width as usize {
-        count_only
+    // The acknowledgement action matters more than the baud here: a gap is
+    // only cleared by an explicit key, so never trade the hint away for detail.
+    let candidates = if ack_available {
+        vec![
+            format!("GAP a=ack MCP{count} {}", device.baud),
+            format!("GAP a=ack MCP{count}"),
+            "GAP a=ack".to_owned(),
+        ]
     } else {
-        format!("MCP{count}").chars().take(width as usize).collect()
+        vec![
+            format!("GAP MCP{count} {}", device.baud),
+            format!("GAP MCP{count}"),
+            "GAP".to_owned(),
+        ]
     };
+    let first_line = candidates
+        .iter()
+        .find(|line| line.chars().count() <= width as usize)
+        .cloned()
+        .unwrap_or_else(|| "GAP".chars().take(width.max(1) as usize).collect());
     format!("{first_line}\n{compact_status}")
 }
 
@@ -2647,16 +2704,8 @@ fn baud_dialog_supported(width: u16, height: u16) -> bool {
     width >= 16 && height >= 5
 }
 
-fn vt_screen_width(term_width: u16, pane_visible: bool) -> u16 {
-    let sidebar_width = if term_width < 64 {
-        if pane_visible {
-            0
-        } else {
-            term_width.min(26)
-        }
-    } else {
-        28
-    };
+fn vt_screen_width(term_width: u16) -> u16 {
+    let sidebar_width = if term_width < 64 { 0 } else { 28 };
     term_width
         .saturating_sub(sidebar_width)
         .saturating_sub(2)
@@ -2830,10 +2879,177 @@ fn base64_encode(b: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Most header tests describe the normal case: `a` is available.
+    fn gap_prompt_header(
+        device: &Device,
+        count: &str,
+        status: &str,
+        width: u16,
+        available_rows: u16,
+    ) -> String {
+        gap_prompt_header_for(device, count, status, width, available_rows, true)
+    }
+
     fn test_device(port: String) -> Device {
         let mut device = Device::new(port);
         device.screen.screen_mut().set_size(20, 80);
         device
+    }
+
+    #[test]
+    fn acknowledgement_hint_only_appears_when_the_key_would_acknowledge() {
+        let device = Device {
+            port: "synthetic-device".into(),
+            state: "connected".into(),
+            baud: "115200".into(),
+            control: "available".into(),
+            ..Device::default()
+        };
+        let gap_status = "Output gap; cached screen retained";
+        // Sidebar focused and nothing blocking: `a` works, so it is advertised.
+        assert!(gap_prompt_header_for(&device, "3", gap_status, 80, 4, true).contains('a'));
+        // Pane focused: `a` would be sent to the device, so never suggest it.
+        for width in [8u16, 16, 32, 80] {
+            for rows in [1u16, 2, 4] {
+                let header = gap_prompt_header_for(&device, "3", gap_status, width, rows, false);
+                assert!(
+                    !header.contains("a=ack") && !header.contains("a acknowledges"),
+                    "hint offered where the key would reach the device: {header:?}"
+                );
+            }
+        }
+        // Recovery blocks every key but the reconnect one.
+        let recovery = "Daemon unavailable · r reconnects · cached screens retained";
+        let header = gap_prompt_header_for(&device, "3", recovery, 80, 4, false);
+        assert!(!header.contains("a acknowledges"), "{header:?}");
+        assert!(header.contains("r reconnect"), "{header:?}");
+    }
+
+    #[test]
+    fn the_cached_screen_tracks_the_pane_but_not_a_hidden_drawer() {
+        // Widening must follow the pane, or new output past the pane edge is
+        // stored but never shown; narrowing while the pane is visible is also
+        // correct, because that is the width the user is reading at.
+        assert_eq!(layout_screen_width(50, true, true), Some(48));
+        assert_eq!(layout_screen_width(64, false, false), Some(34));
+        assert_eq!(layout_screen_width(100, false, false), Some(70));
+        // A narrow terminal hides the pane behind the drawer: shrinking then
+        // would truncate cells vt100 cannot restore, with no gap to show it.
+        assert_eq!(layout_screen_width(50, false, true), None);
+
+        let mut device = test_device("synthetic-device".into());
+        device.screen_width = 1;
+        fit_cached_screen(&mut device, 20, 48);
+        assert_eq!(device.screen.screen().size(), (20, 48));
+        fit_cached_screen(&mut device, 24, 70);
+        assert_eq!(device.screen.screen().size(), (24, 70));
+
+        // Output written at the pane width is visible in the pane width.
+        device.screen.process(b"RIGHTMARGIN_xxxxxxxxxxxxxxxxxxxx");
+        let screen = device.screen.screen();
+        let row: String = (0..70)
+            .filter_map(|c| screen.cell(0, c).map(|cell| cell.contents().to_string()))
+            .collect();
+        assert!(row.contains("xxxxxxxxxxxxxxxxxxxx"), "{row:?}");
+    }
+
+    #[test]
+    fn failed_previous_leave_clears_active_without_claiming_membership() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let mut client = Client {
+            stream,
+            reader,
+            id: 0,
+            events: VecDeque::new(),
+            overflow: false,
+        };
+        let server = std::thread::spawn(move || {
+            let mut peer_reader = BufReader::new(peer.try_clone().unwrap());
+            let mut line = String::new();
+            peer_reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let response = json!({"v": V, "id": request["id"], "ok": false,
+                "error": {"message": "synthetic unsubscribe rejection"}});
+            peer.write_all(format!("{response}\n").as_bytes()).unwrap();
+        });
+        let mut devs = vec![
+            test_device("synthetic-first".into()),
+            test_device("synthetic-second".into()),
+        ];
+        devs[0].joined = true;
+        let mut active = Some(0usize);
+        let mut daemon_lost = false;
+        let mut leave_outcome_unknown = false;
+        let mut operation_failure = None;
+        let mut status = String::new();
+        assert!(!release_previous_membership(
+            &mut client,
+            &mut devs,
+            &mut active,
+            1,
+            &mut daemon_lost,
+            &mut leave_outcome_unknown,
+            &mut operation_failure,
+            &mut status,
+        ));
+        assert!(
+            active.is_none(),
+            "unknown leave outcome kept a stale active"
+        );
+        assert!(!devs[0].joined);
+        assert!(devs[0].gap);
+        assert!(daemon_lost && leave_outcome_unknown);
+        client.close();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn successful_previous_leave_clears_active_before_the_new_join() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let mut client = Client {
+            stream,
+            reader,
+            id: 0,
+            events: VecDeque::new(),
+            overflow: false,
+        };
+        let server = std::thread::spawn(move || {
+            let mut peer_reader = BufReader::new(peer.try_clone().unwrap());
+            for _ in 1..=2 {
+                let mut line = String::new();
+                peer_reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let response = json!({"v": V, "id": request["id"], "ok": true, "result": {}});
+                peer.write_all(format!("{response}\n").as_bytes()).unwrap();
+            }
+        });
+        let mut devs = vec![
+            test_device("synthetic-first".into()),
+            test_device("synthetic-second".into()),
+        ];
+        devs[0].joined = true;
+        let mut active = Some(0usize);
+        let mut daemon_lost = false;
+        let mut leave_outcome_unknown = false;
+        let mut operation_failure = None;
+        let mut status = String::new();
+        assert!(release_previous_membership(
+            &mut client,
+            &mut devs,
+            &mut active,
+            1,
+            &mut daemon_lost,
+            &mut leave_outcome_unknown,
+            &mut operation_failure,
+            &mut status,
+        ));
+        assert!(active.is_none(), "active must be cleared before joining");
+        assert!(!devs[0].joined && devs[0].gap);
+        assert!(!devs[1].joined, "the new device is not joined yet");
+        client.close();
+        server.join().unwrap();
     }
 
     #[test]
@@ -3016,7 +3232,7 @@ mod tests {
             16,
             2,
         );
-        assert_eq!(header, "GAP MCP3 115200\nr reconnect");
+        assert_eq!(header, "GAP a=ack MCP3\nr reconnect");
         assert_eq!(prompt_header_height(&header, 16, 5), 2);
         assert_eq!(
             prompt_header_height(&header, 16, 5).min(5_u16.saturating_sub(3).max(1)),
@@ -3030,18 +3246,25 @@ mod tests {
                 32,
                 2,
             ),
-            "GAP MCP3 115200\nr reconnect"
+            "GAP a=ack MCP3 115200\nr reconnect"
         );
         assert_eq!(
-            gap_prompt_header(&device, "3", "Input outcome unknown; not replayed", 16, 2,),
+            gap_prompt_header(&device, "3", "Input outcome unknown; not replayed", 16, 2),
             "Input? unknown\nNo replay"
         );
         assert_eq!(
-            gap_prompt_header(&device, "3", "Input outcome unknown; not replayed", 16, 1,),
+            gap_prompt_header(&device, "3", "Input outcome unknown; not replayed", 16, 1),
             "Input? no replay"
         );
         assert_eq!(
-            gap_prompt_header(&device, "3", "Daemon unavailable · r reconnects", 16, 1),
+            gap_prompt_header_for(
+                &device,
+                "3",
+                "Daemon unavailable · r reconnects",
+                16,
+                1,
+                false
+            ),
             "r MCP3"
         );
         assert_eq!(
@@ -3155,7 +3378,7 @@ mod tests {
                 16,
                 2,
             ),
-            "GAP MCP3 115200\nEnter reconnect"
+            "GAP a=ack MCP3\nEnter reconnect"
         );
         assert_eq!(
             gap_prompt_header(
@@ -3165,7 +3388,7 @@ mod tests {
                 16,
                 2,
             ),
-            "GAP MCP3 115200\nSub fail · r"
+            "GAP a=ack MCP3\nSub fail · r"
         );
         assert_eq!(
             recovery_prompt_header(
@@ -3440,9 +3663,8 @@ mod tests {
         );
         assert!(baud_dialog_supported(16, 5));
         assert!(!baud_dialog_supported(10, 1));
-        assert_eq!(vt_screen_width(50, true), 48);
-        assert_eq!(vt_screen_width(50, false), 22);
-        assert_eq!(vt_screen_width(100, true), 70);
+        assert_eq!(vt_screen_width(50), 48);
+        assert_eq!(vt_screen_width(100), 70);
         let mut digits = String::new();
         for digit in "0000000".chars() {
             assert!(push_baud_digit(&mut digits, digit));

@@ -155,6 +155,20 @@ def _pump(fd, buf, seconds):
             time.sleep(0.01)
 
 
+def _pane_focus(text):
+    """The pane holds focus, whichever line carries the marker."""
+    return "focus:pane" in text or "Terminal · FOCUS" in text
+
+
+def _sidebar_focus(text):
+    """The sidebar holds focus; a gap/baud prompt replaces the header line."""
+    return (
+        "focus:sidebar" in text
+        or "Devices · FOCUS" in text
+        or "Sidebar focus" in text
+    )
+
+
 def _open_selected(fd, buf, rows=30, cols=100, baud=b"115200"):
     """Press Enter on the selected device, answering a baud prompt if asked."""
     os.write(fd, b"\r")
@@ -162,13 +176,13 @@ def _open_selected(fd, buf, rows=30, cols=100, baud=b"115200"):
     while time.monotonic() < deadline:
         _pump(fd, buf, 0.1)
         text = _screen(buf, rows, cols)
-        if "Terminal · FOCUS" in text:
+        if _pane_focus(text):
             return text
         if "Baud rate 1" in text or "Baud:" in text:
             os.write(fd, baud + b"\r")
         if "OUTPUT GAP" in text and ("Connected" in text or "control" in text):
             return text
-    return _wait_screen(fd, buf, lambda t: "Terminal · FOCUS" in t, timeout=5, rows=rows, cols=cols)
+    return _wait_screen(fd, buf, _pane_focus, timeout=5, rows=rows, cols=cols)
 
 
 def _wait_screen(fd, buf, predicate, timeout=5, rows=30, cols=100):
@@ -360,12 +374,12 @@ def test_rust_terminal_ctrl_bracket_focus_keeps_membership_and_output(tmp_path, 
     try:
         _wait_screen(master, output, lambda t: port in t)
         os.write(master, b"\r115200\r")
-        _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t, timeout=8)
+        _wait_screen(master, output, _pane_focus, timeout=8)
         assert _members(observer, port) == 1
 
         # Ctrl-] only moves focus: membership and subscription must survive.
         os.write(master, b"\x1d")
-        text = _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        text = _wait_screen(master, output, _sidebar_focus)
         assert _members(observer, port) == 1
         assert "GAP" not in text
 
@@ -378,7 +392,7 @@ def test_rust_terminal_ctrl_bracket_focus_keeps_membership_and_output(tmp_path, 
 
         # Ctrl-] toggles back to the pane without a gap.
         os.write(master, b"\x1d")
-        text = _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t)
+        text = _wait_screen(master, output, _pane_focus)
         assert _members(observer, port) == 1
         assert "GAP" not in text
 
@@ -389,7 +403,7 @@ def test_rust_terminal_ctrl_bracket_focus_keeps_membership_and_output(tmp_path, 
 
         # Quit is a sidebar action: return focus there first.
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
         os.write(master, b"q")
         proc.wait(timeout=5)
         assert observer.status()["devices"] == []
@@ -408,9 +422,9 @@ def test_rust_terminal_sidebar_focus_routes_input_away_from_device(tmp_path, mon
     try:
         _wait_screen(master, output, lambda t: port in t)
         os.write(master, b"\r115200\r")
-        _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t, timeout=8)
+        _wait_screen(master, output, _pane_focus, timeout=8)
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
         while select.select([device_master], [], [], 0)[0]:
             os.read(device_master, 4096)
 
@@ -438,7 +452,7 @@ def test_rust_terminal_sidebar_focus_routes_input_away_from_device(tmp_path, mon
 
         # Re-entering the joined device returns to the pane without a gap.
         os.write(master, b"\r")
-        text = _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t)
+        text = _wait_screen(master, output, _pane_focus)
         assert _members(observer, port) == 1
         assert "GAP" not in text
         while select.select([device_master], [], [], 0)[0]:
@@ -448,7 +462,7 @@ def test_rust_terminal_sidebar_focus_routes_input_away_from_device(tmp_path, mon
         assert readable and os.read(device_master, 1) == b"W"
 
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
         os.write(master, b"q")
         proc.wait(timeout=5)
     finally:
@@ -464,7 +478,7 @@ def test_rust_terminal_ctrl_bracket_literal_escape_still_sends_ctrl_bracket(tmp_
     try:
         _wait_screen(master, output, lambda t: port in t)
         os.write(master, b"\r115200\r")
-        _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t, timeout=8)
+        _wait_screen(master, output, _pane_focus, timeout=8)
         while select.select([device_master], [], [], 0)[0]:
             os.read(device_master, 4096)
 
@@ -474,7 +488,7 @@ def test_rust_terminal_ctrl_bracket_literal_escape_still_sends_ctrl_bracket(tmp_
         readable, _, _ = select.select([device_master], [], [], 3)
         assert readable and os.read(device_master, 1) == b"\x1d"
         # The literal path must not move focus to the sidebar.
-        assert "Devices · FOCUS" not in _screen(output)
+        assert not _sidebar_focus(_screen(output))
 
         os.write(master, b"\x16")
         _read_until(master, output, b"Next key sent", timeout=5)
@@ -483,7 +497,7 @@ def test_rust_terminal_ctrl_bracket_literal_escape_still_sends_ctrl_bracket(tmp_
         assert readable and os.read(device_master, 1) == b"\x1b"
 
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
         os.write(master, b"q")
         proc.wait(timeout=5)
     finally:
@@ -501,7 +515,7 @@ def test_rust_terminal_gap_acknowledged_explicitly_and_never_auto_cleared(tmp_pa
     try:
         _wait_screen(master, output, lambda t: port in t)
         os.write(master, b"\r115200\r")
-        _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t, timeout=8)
+        _wait_screen(master, output, _pane_focus, timeout=8)
         os.write(device_master, b"\r\nKEEP_ME_CACHED")
         _wait_screen(master, output, lambda t: "KEEP_ME_CACHED" in t, timeout=5)
 
@@ -517,7 +531,7 @@ def test_rust_terminal_gap_acknowledged_explicitly_and_never_auto_cleared(tmp_pa
 
         # Explicit acknowledgement clears the marker but keeps the scrollback.
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
         os.write(master, b"a")
         text = _wait_screen(master, output, lambda t: "Gap acknowledged" in t)
         assert "KEEP_ME_CACHED" in text
@@ -534,7 +548,7 @@ def test_rust_terminal_gap_acknowledged_explicitly_and_never_auto_cleared(tmp_pa
         assert "KEEP_ME_CACHED" in text
         assert "OUTPUT GAP" in text
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
 
         os.write(master, b"q")
         proc.wait(timeout=5)
@@ -563,7 +577,7 @@ def test_rust_terminal_switching_devices_keeps_membership_and_gap_semantics(tmp_
 
         # Join whichever device the sidebar starts on.
         os.write(master, b"\r115200\r")
-        _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t, timeout=8)
+        _wait_screen(master, output, _pane_focus, timeout=8)
         first_port = joined_port()
         assert first_port in by_port, observer.status()
         first_master = by_port[first_port]
@@ -575,7 +589,7 @@ def test_rust_terminal_switching_devices_keeps_membership_and_gap_semantics(tmp_
 
         # Sidebar navigation alone never detaches.
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
         os.write(master, b"\x1b[B")
         _pump(master, output, 0.3)
         assert joined_port() == first_port
@@ -585,7 +599,7 @@ def test_rust_terminal_switching_devices_keeps_membership_and_gap_semantics(tmp_
         _wait_screen(master, output, lambda t: "Baud rate 1" in t, timeout=5)
         assert joined_port() == first_port
         os.write(master, b"115200\r")
-        _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t, timeout=8)
+        _wait_screen(master, output, _pane_focus, timeout=8)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline and joined_port() != second_port:
             time.sleep(0.01)
@@ -595,7 +609,7 @@ def test_rust_terminal_switching_devices_keeps_membership_and_gap_semantics(tmp_
 
         # Returning marks the first with a genuine gap and keeps its cache.
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
         os.write(master, b"\x1b[A")
         _pump(master, output, 0.2)
         text = _open_selected(master, output)
@@ -607,11 +621,147 @@ def test_rust_terminal_switching_devices_keeps_membership_and_gap_semantics(tmp_
         assert joined_port() == first_port, observer.status()
 
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t)
+        _wait_screen(master, output, _sidebar_focus)
         os.write(master, b"q")
         proc.wait(timeout=5)
     finally:
         _stop_synthetic_terminal(daemon, proc, master, devices, [observer])
+
+
+def test_rust_terminal_focus_does_not_truncate_cached_screen(tmp_path, monkeypatch, terminal_binary):
+    runtime, daemon, proc, master, devices = _start_synthetic_terminal(
+        tmp_path, monkeypatch, terminal_binary, 1, size=(24, 50)
+    )
+    device_master, port = devices[0]
+    output = bytearray()
+    observer = ipc.DaemonClient.connect(runtime / "daemon.sock")
+    observer.hello("mcp", "narrow-cache-observer")
+    try:
+        _wait_screen(master, output, lambda t: port in t, rows=24, cols=50)
+        os.write(master, b"\r115200\r")
+        _wait_screen(master, output, _pane_focus, timeout=8, rows=24, cols=50)
+
+        # A wide line reaches the far right of the pane while focus is there.
+        marker = b"RIGHTMARGIN_" + b"x" * 20
+        os.write(device_master, b"\r\n" + marker)
+        text = _wait_screen(
+            master, output, lambda t: "RIGHTMARGIN_" in t, timeout=5, rows=24, cols=50
+        )
+        assert "x" * 20 in text
+
+        # Focusing the narrow drawer must not truncate the cached cells, so the
+        # right edge is still there when the pane comes back.
+        os.write(master, b"\x1d")
+        _wait_screen(master, output, _sidebar_focus, rows=24, cols=50)
+        os.write(master, b"\x1d")
+        text = _wait_screen(master, output, _pane_focus, rows=24, cols=50)
+        assert "x" * 20 in text
+        assert "GAP" not in text
+
+        os.write(master, b"\x1d")
+        _wait_screen(master, output, _sidebar_focus, rows=24, cols=50)
+        os.write(master, b"q")
+        proc.wait(timeout=5)
+    finally:
+        _stop_synthetic_terminal(daemon, proc, master, devices, [observer])
+
+
+def test_rust_terminal_invalid_baud_does_not_detach_the_current_device(tmp_path, monkeypatch, terminal_binary):
+    runtime, daemon, proc, master, devices = _start_synthetic_terminal(
+        tmp_path, monkeypatch, terminal_binary, 2
+    )
+    by_port = {port: device_master for device_master, port in devices}
+    output = bytearray()
+    observer = ipc.DaemonClient.connect(runtime / "daemon.sock")
+    observer.hello("mcp", "switch-baud-observer")
+    try:
+        _wait_screen(
+            master, output, lambda t: all(port in t for _, port in devices), timeout=8
+        )
+
+        def joined_port():
+            for device in observer.status()["devices"]:
+                if device["members"] == 1:
+                    return device["port"]
+            return None
+
+        os.write(master, b"\r115200\r")
+        _wait_screen(master, output, _pane_focus, timeout=8)
+        first_port = joined_port()
+        assert first_port in by_port
+
+        # Select the other device and enter an out-of-range baud. Nothing is joined,
+        # so the existing membership must not be released.
+        os.write(master, b"\x1d")
+        _wait_screen(master, output, _sidebar_focus)
+        os.write(master, b"\x1b[B")
+        _pump(master, output, 0.2)
+        os.write(master, b"\r")
+        _wait_screen(master, output, lambda t: "Baud rate 1" in t, timeout=5)
+        # An out-of-range value is rejected and the existing membership survives it.
+        os.write(master, b"4000001\r")
+        _wait_screen(master, output, lambda t: "Invalid baud rate" in t, timeout=5)
+        assert joined_port() == first_port, observer.status()
+        assert not [d for d in observer.status()["devices"] if d["state"] == "closing"]
+
+        # The still-joined device keeps working: route input and output as before.
+        os.write(master, b"\x1b[A")
+        _pump(master, output, 0.2)
+        os.write(master, b"\r")
+        _wait_screen(master, output, _pane_focus, timeout=8)
+        assert joined_port() == first_port
+        first_master = by_port[first_port]
+        while select.select([first_master], [], [], 0)[0]:
+            os.read(first_master, 4096)
+        os.write(master, b"K")
+        readable, _, _ = select.select([first_master], [], [], 3)
+        assert readable and os.read(first_master, 1) == b"K"
+
+        os.write(master, b"\x1d")
+        _wait_screen(master, output, _sidebar_focus)
+        os.write(master, b"q")
+        proc.wait(timeout=5)
+    finally:
+        _stop_synthetic_terminal(daemon, proc, master, devices, [observer])
+
+
+def test_rust_terminal_resize_wider_keeps_cached_screen(tmp_path, monkeypatch, terminal_binary):
+    runtime, daemon, proc, master, devices = _start_synthetic_terminal(
+        tmp_path, monkeypatch, terminal_binary, 1, size=(24, 50)
+    )
+    device_master, port = devices[0]
+    output = bytearray()
+    try:
+        _wait_screen(master, output, lambda t: port in t, rows=24, cols=50)
+        os.write(master, b"\r115200\r")
+        _wait_screen(master, output, _pane_focus, timeout=8, rows=24, cols=50)
+        os.write(device_master, b"\r\nKEEPRIGHT_" + b"y" * 20)
+        _wait_screen(master, output, lambda t: "KEEPRIGHT_" in t, timeout=5, rows=24, cols=50)
+
+        # Between 50 and 63 columns the drawer hides the pane; widening past 64
+        # brings the narrow sidebar back. Either way the pane width must end up
+        # able to show the cached right edge, and no gap may be invented.
+        os.write(master, b"\x1d")
+        _wait_screen(master, output, _sidebar_focus, rows=24, cols=50)
+        for cols in (64, 80, 100):
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, cols, 0, 0))
+            os.kill(proc.pid, signal.SIGWINCH)
+            _wait_screen(master, output, _sidebar_focus, rows=24, cols=cols, timeout=6)
+        # Let any queued resize repaint settle before the focus keystroke.
+        _pump(master, output, 0.5)
+        os.write(master, b"\x1d")
+        text = _wait_screen(
+            master, output, _pane_focus, rows=24, cols=100, timeout=6
+        )
+        assert "y" * 20 in text, text
+        assert "GAP" not in text
+
+        os.write(master, b"\x1d")
+        _wait_screen(master, output, _sidebar_focus, rows=24, cols=100)
+        os.write(master, b"q")
+        proc.wait(timeout=5)
+    finally:
+        _stop_synthetic_terminal(daemon, proc, master, devices)
 
 
 def test_rust_terminal_narrow_drawer_focus_and_resize(tmp_path, monkeypatch, terminal_binary):
@@ -625,18 +775,18 @@ def test_rust_terminal_narrow_drawer_focus_and_resize(tmp_path, monkeypatch, ter
     try:
         _wait_screen(master, output, lambda t: port in t, rows=24, cols=50)
         os.write(master, b"\r115200\r")
-        _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t, timeout=8, rows=24, cols=50)
+        _wait_screen(master, output, _pane_focus, timeout=8, rows=24, cols=50)
 
         # Ctrl-] brings the narrow drawer back with the device list visible.
         os.write(master, b"\x1d")
         text = _wait_screen(
-            master, output, lambda t: "Devices · FOCUS" in t, rows=24, cols=50
+            master, output, _sidebar_focus, rows=24, cols=50
         )
         assert "Devices" in text
         assert _members(observer, port) == 1
 
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Terminal · FOCUS" in t, rows=24, cols=50)
+        _wait_screen(master, output, _pane_focus, rows=24, cols=50)
         assert _members(observer, port) == 1
 
         # Resizing while focused keeps the app alive, joined and rendering.
@@ -644,7 +794,7 @@ def test_rust_terminal_narrow_drawer_focus_and_resize(tmp_path, monkeypatch, ter
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
             os.kill(proc.pid, signal.SIGWINCH)
             _wait_screen(
-                master, output, lambda t: "Terminal · FOCUS" in t, rows=rows, cols=cols, timeout=6
+                master, output, _pane_focus, rows=rows, cols=cols, timeout=6
             )
         assert proc.poll() is None
         assert _members(observer, port) == 1
@@ -652,7 +802,7 @@ def test_rust_terminal_narrow_drawer_focus_and_resize(tmp_path, monkeypatch, ter
         _wait_screen(master, output, lambda t: "AFTER_RESIZE" in t, timeout=5)
 
         os.write(master, b"\x1d")
-        _wait_screen(master, output, lambda t: "Devices · FOCUS" in t, rows=24, cols=50)
+        _wait_screen(master, output, _sidebar_focus, rows=24, cols=50)
         os.write(master, b"q")
         proc.wait(timeout=5)
     finally:
