@@ -261,11 +261,17 @@ fn release_previous_membership(
 /// The buffer must match the pane it is rendered into: vt100 stores cells and
 /// wraps at the width it was given, so a wider buffer than the pane hides new
 /// output past the right edge, and a narrower one clips text the pane could
-/// show. The one case that must not resize is a narrow terminal whose pane is
-/// hidden behind the full-width drawer: shrinking then would truncate cells
+/// show. The one case that must not resize is a narrow terminal showing the
+/// full-width drawer instead of the pane: shrinking then would truncate cells
 /// vt100 cannot restore, losing cached output with no gap to show for it.
-fn layout_screen_width(term_width: u16, focus_pane: bool, pane_hidden_drawer: bool) -> Option<u16> {
-    if pane_hidden_drawer && !focus_pane {
+/// A narrow terminal shows one thing at a time: the device list (as a full-width
+/// drawer) while the sidebar holds focus, otherwise the pane.
+fn drawer_for(term_width: u16, focus_pane: bool, joined: bool) -> bool {
+    term_width < 64 && joined && !focus_pane
+}
+
+fn layout_screen_width(term_width: u16, drawer: bool) -> Option<u16> {
+    if drawer {
         None
     } else {
         Some(vt_screen_width(term_width))
@@ -443,7 +449,8 @@ fn run() -> Result<(), String> {
             }
             if let Some(i) = active {
                 let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-                if let Some(screen_width) = layout_screen_width(width, focus_pane, width < 64) {
+                let drawer = drawer_for(width, focus_pane, active.is_some());
+                if let Some(screen_width) = layout_screen_width(width, drawer) {
                     fit_cached_screen(&mut devs[i], height.saturating_sub(4).max(1), screen_width);
                 }
             }
@@ -672,12 +679,16 @@ fn run() -> Result<(), String> {
             }
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
             let narrow = term_width < 64;
+            // A narrow terminal shows one thing at a time: the pane, or the device
+            // list as a full-width drawer. The pane is never rendered at a reduced
+            // width, so its cached screen keeps the width it was written at.
+            let drawer = drawer_for(term_width, focus_pane, active.is_some());
             let pane_visible = active.is_some() && focus_pane;
             let sidebar_width = if narrow {
                 if pane_visible {
                     0
                 } else {
-                    term_width.min(26)
+                    term_width
                 }
             } else {
                 28
@@ -830,7 +841,7 @@ fn run() -> Result<(), String> {
             let screen_row_offset = screen_rows.saturating_sub(pane_height);
             let sidebar_offset = selected.saturating_add(1).saturating_sub(visible_devices);
             if let Some(i) = active {
-                if let Some(screen_width) = layout_screen_width(term_width, focus_pane, narrow) {
+                if let Some(screen_width) = layout_screen_width(term_width, drawer) {
                     fit_cached_screen(&mut devs[i], screen_rows, screen_width);
                 }
             }
@@ -917,10 +928,14 @@ fn run() -> Result<(), String> {
                 f.render_widget(
                     List::new(items).block(
                         Block::default()
-                            .title(if focus_pane && active.is_some() {
-                                " Devices · a ack · Ctrl-] "
-                            } else {
+                            .title(if active.is_some() && focus_pane {
+                                " Devices · Ctrl-] "
+                            } else if recovery_input_blocked {
+                                " Devices · FOCUS · r retry "
+                            } else if devs.get(selected).is_some_and(|d| d.gap) {
                                 " Devices · FOCUS · a ack · d del "
+                            } else {
+                                " Devices · FOCUS · d del · q quit "
                             })
                             .borders(Borders::ALL),
                     ),
@@ -981,7 +996,7 @@ fn run() -> Result<(), String> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_else(|| vec![Line::from("Choose a device · Enter joins · q quits")]);
-                if pane_height > 0 {
+                if pane_height > 0 && !drawer {
                     f.render_widget(
                         Paragraph::new(lines).block(
                             Block::default()
@@ -999,7 +1014,7 @@ fn run() -> Result<(), String> {
                         cols[1],
                     );
                 }
-                if let Some(i) = active {
+                if let Some(i) = active.filter(|_| !drawer) {
                     let screen = devs[i].screen.screen();
                     let row_offset = screen.size().0.saturating_sub(pane_height);
                     if pane_height > 0
@@ -1033,9 +1048,10 @@ fn run() -> Result<(), String> {
                             status = "Ready".into();
                         }
                         if let Some(i) = active {
-                            if let Some(screen_width) =
-                                layout_screen_width(cols, focus_pane, cols < 64)
-                            {
+                            if let Some(screen_width) = layout_screen_width(
+                                cols,
+                                drawer_for(cols, focus_pane, active.is_some()),
+                            ) {
                                 fit_cached_screen(
                                     &mut devs[i],
                                     rows.saturating_sub(4).max(1),
@@ -1316,6 +1332,7 @@ fn run() -> Result<(), String> {
                                 }
                             }
                         }
+                        focus_pane = false;
                         baud_size_warning = false;
                         literal_next = false;
                     }
@@ -2926,25 +2943,30 @@ mod tests {
     }
 
     #[test]
-    fn the_cached_screen_tracks_the_pane_but_not_a_hidden_drawer() {
-        // Widening must follow the pane, or new output past the pane edge is
-        // stored but never shown; narrowing while the pane is visible is also
-        // correct, because that is the width the user is reading at.
-        assert_eq!(layout_screen_width(50, true, true), Some(48));
-        assert_eq!(layout_screen_width(64, false, false), Some(34));
-        assert_eq!(layout_screen_width(100, false, false), Some(70));
-        // A narrow terminal hides the pane behind the drawer: shrinking then
+    fn the_cached_screen_tracks_the_pane_but_not_the_drawer() {
+        // Whatever width the pane is rendered at is the width the buffer must
+        // have: wider hides output past the edge, narrower clips text the pane
+        // could show. The drawer case must not resize at all, because shrinking
         // would truncate cells vt100 cannot restore, with no gap to show it.
-        assert_eq!(layout_screen_width(50, false, true), None);
+        assert_eq!(layout_screen_width(50, false), Some(48));
+        assert_eq!(layout_screen_width(64, false), Some(34));
+        assert_eq!(layout_screen_width(100, false), Some(70));
+        assert_eq!(layout_screen_width(50, true), None);
+
+        // The drawer exists exactly when a narrow terminal is showing the device
+        // list instead of the pane, so the pane is never rendered beside it.
+        assert!(drawer_for(50, false, true));
+        assert!(!drawer_for(50, true, true), "the pane is on screen");
+        assert!(!drawer_for(100, false, true), "wide layouts show both");
+        assert!(!drawer_for(50, false, false), "nothing is joined");
 
         let mut device = test_device("synthetic-device".into());
         device.screen_width = 1;
         fit_cached_screen(&mut device, 20, 48);
         assert_eq!(device.screen.screen().size(), (20, 48));
+        // A wider pane takes the new width, and content written at it is visible.
         fit_cached_screen(&mut device, 24, 70);
         assert_eq!(device.screen.screen().size(), (24, 70));
-
-        // Output written at the pane width is visible in the pane width.
         device.screen.process(b"RIGHTMARGIN_xxxxxxxxxxxxxxxxxxxx");
         let screen = device.screen.screen();
         let row: String = (0..70)

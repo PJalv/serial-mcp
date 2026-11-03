@@ -642,12 +642,14 @@ def test_rust_terminal_focus_does_not_truncate_cached_screen(tmp_path, monkeypat
         _wait_screen(master, output, _pane_focus, timeout=8, rows=24, cols=50)
 
         # A wide line reaches the far right of the pane while focus is there.
-        marker = b"RIGHTMARGIN_" + b"x" * 20
+        marker = b"RIGHTMARGIN_" + b"x" * 60
         os.write(device_master, b"\r\n" + marker)
         text = _wait_screen(
             master, output, lambda t: "RIGHTMARGIN_" in t, timeout=5, rows=24, cols=50
         )
-        assert "x" * 20 in text
+        # A 48-column pane wraps the 71-character line after ~40 x's; a shorter
+        # run would also pass in a 22-column pane, so count what is visible.
+        assert "x" * 25 in text, "the pane wrapped the long line"
 
         # Focusing the narrow drawer must not truncate the cached cells, so the
         # right edge is still there when the pane comes back.
@@ -735,7 +737,7 @@ def test_rust_terminal_resize_wider_keeps_cached_screen(tmp_path, monkeypatch, t
         _wait_screen(master, output, lambda t: port in t, rows=24, cols=50)
         os.write(master, b"\r115200\r")
         _wait_screen(master, output, _pane_focus, timeout=8, rows=24, cols=50)
-        os.write(device_master, b"\r\nKEEPRIGHT_" + b"y" * 20)
+        os.write(device_master, b"\r\nKEEPRIGHT_" + b"y" * 60)
         _wait_screen(master, output, lambda t: "KEEPRIGHT_" in t, timeout=5, rows=24, cols=50)
 
         # Between 50 and 63 columns the drawer hides the pane; widening past 64
@@ -758,6 +760,41 @@ def test_rust_terminal_resize_wider_keeps_cached_screen(tmp_path, monkeypatch, t
 
         os.write(master, b"\x1d")
         _wait_screen(master, output, _sidebar_focus, rows=24, cols=100)
+        os.write(master, b"q")
+        proc.wait(timeout=5)
+    finally:
+        _stop_synthetic_terminal(daemon, proc, master, devices)
+
+
+def test_rust_terminal_narrow_drawer_hides_the_pane(tmp_path, monkeypatch, terminal_binary):
+    runtime, daemon, proc, master, devices = _start_synthetic_terminal(
+        tmp_path, monkeypatch, terminal_binary, 1, size=(24, 50)
+    )
+    device_master, port = devices[0]
+    output = bytearray()
+    try:
+        _wait_screen(master, output, lambda t: port in t, rows=24, cols=50)
+        os.write(master, b"\r115200\r")
+        _wait_screen(master, output, _pane_focus, timeout=8, rows=24, cols=50)
+        os.write(device_master, b"\r\nDRAWER_CACHE")
+        _wait_screen(master, output, lambda t: "DRAWER_CACHE" in t, timeout=5, rows=24, cols=50)
+
+        # Narrow + sidebar focus: the device list is a drawer over the whole
+        # width, not a 26-column column beside a squeezed pane.
+        os.write(master, b"\x1d")
+        text = _wait_screen(master, output, _sidebar_focus, rows=24, cols=50)
+        assert "Serial terminal" not in text, text
+        assert "Terminal · unfocused" not in text, text
+        assert port in text, text
+
+        # Returning shows the cached pane again, un-truncated and without a gap.
+        os.write(master, b"\x1d")
+        text = _wait_screen(master, output, _pane_focus, rows=24, cols=50)
+        assert "DRAWER_CACHE" in text, text
+        assert "GAP" not in text
+
+        os.write(master, b"\x1d")
+        _wait_screen(master, output, _sidebar_focus, rows=24, cols=50)
         os.write(master, b"q")
         proc.wait(timeout=5)
     finally:
