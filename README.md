@@ -498,7 +498,7 @@ stdlib-only.
 
 ## Human terminal
 
-`serial-mcp-terminal` is an install-time-built Rust multi-device TUI for humans. It shows available and open devices in a left sidebar, keeps MCP-only count/status visible, and renders device ANSI output inside a VT100 screen buffer. Switching leaves the prior membership; cached screens are retained locally with an observation-gap marker. The TUI never acquires AI control. Use Ctrl-] or Esc to leave, Ctrl-B for confirmed shared baud changes, and `q` or Ctrl-Q from the sidebar to quit. Install and usage details, lifecycle semantics and accepted concurrent-input risks are in
+`serial-mcp-terminal` is an install-time-built Rust multi-device TUI for humans. It shows available and open devices in a left sidebar, keeps MCP-only count/status visible, and renders device ANSI output inside a VT100 screen buffer. Ctrl-] moves focus between the pane and the sidebar without changing membership, so it never invents an output gap; opening a different device leaves the prior membership and retains its cached screen with an observation-gap marker. A real gap is cleared only by an explicit `a` acknowledgement. The TUI never acquires AI control. Esc leaves the current device, Ctrl-B makes confirmed shared baud changes, and `q` or Ctrl-Q from the sidebar quits. Install and usage details, lifecycle semantics and accepted concurrent-input risks are in
 [docs/human-terminal.md](docs/human-terminal.md).
 
 ## Legacy engine session surfaces

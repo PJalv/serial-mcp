@@ -110,7 +110,7 @@ impl Client {
         self.req(json!({"op":"unsubscribe","port":device.port}))?;
         self.req(json!({"op":"leave","port":device.port}))?;
         device.joined = false;
-        device.gap = true;
+        record_gap(device);
         Ok(())
     }
 
@@ -189,6 +189,7 @@ struct Device {
     selection: Option<((u16, u16), (u16, u16))>,
     selecting: bool,
     joined: bool,
+    gap_acknowledged: bool,
     input_warning: Option<String>,
     paste_mode_uncertain: bool,
 }
@@ -203,7 +204,7 @@ impl Device {
             control: "available".into(),
             screen: vt100::Parser::new(
                 rows.saturating_sub(4).max(1),
-                vt_screen_width(cols),
+                vt_screen_width(cols, false),
                 SCROLLBACK,
             ),
             gap: false,
@@ -211,11 +212,17 @@ impl Device {
             selection: None,
             selecting: false,
             joined: false,
+            gap_acknowledged: false,
             input_warning: None,
             paste_mode_uncertain: false,
         }
     }
 }
+fn record_gap(device: &mut Device) {
+    device.gap = true;
+    device.gap_acknowledged = false;
+}
+
 fn spawn_daemon() -> Result<Child, String> {
     Command::new("serial-mcp-daemon")
         .process_group(0)
@@ -315,7 +322,7 @@ fn run() -> Result<(), String> {
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("serial-mcp-terminal — shared serial multi-device TUI\\nUsage: serial-mcp-terminal [--help|--version]\\nSidebar: Up/Down or j/k, Enter, q/Ctrl-Q. Pane: Esc/Ctrl-] leaves; Ctrl-V then Ctrl-]/Esc sends literally; Ctrl-B opens shared baud controls; Ctrl-End scrolls to bottom.");
+                println!("serial-mcp-terminal — shared serial multi-device TUI\\nUsage: serial-mcp-terminal [--help|--version]\\nCtrl-] toggles pane/sidebar focus without leaving. Sidebar: Up/Down or j/k, Enter opens, a acknowledges a gap, d disconnects, q/Ctrl-Q quits. Pane: Esc leaves; Ctrl-V then Ctrl-]/Esc sends literally; Ctrl-B opens shared baud controls; Ctrl-End scrolls to bottom.");
                 return Ok(());
             }
             _ => return Err(format!("unknown argument: {arg}")),
@@ -330,6 +337,7 @@ fn run() -> Result<(), String> {
     }
     let mut devs: Vec<Device> = Vec::new();
     let mut active: Option<usize> = None;
+    let mut focus_pane = true;
     let mut selected = 0usize;
     let mut count = hello["mcp_clients"].as_u64().unwrap_or(0).to_string();
     let mut status = "Ready".to_string();
@@ -373,10 +381,10 @@ fn run() -> Result<(), String> {
             }
             if let Some(i) = active {
                 let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
-                devs[i]
-                    .screen
-                    .screen_mut()
-                    .set_size(height.saturating_sub(4).max(1), vt_screen_width(width));
+                devs[i].screen.screen_mut().set_size(
+                    height.saturating_sub(4).max(1),
+                    vt_screen_width(width, focus_pane),
+                );
             }
             let preserve_failure = leave_outcome_unknown || subscription_failed;
             let mut snapshot_ports = HashSet::new();
@@ -408,7 +416,7 @@ fn run() -> Result<(), String> {
                 baud_size_warning = false;
                 if let Some(i) = active.take() {
                     devs[i].joined = false;
-                    devs[i].gap = true;
+                    record_gap(&mut devs[i]);
                 }
                 if !preserve_failure {
                     status = "Daemon unavailable · r reconnects · cached screens retained".into();
@@ -476,7 +484,7 @@ fn run() -> Result<(), String> {
             if c.overflow {
                 c.overflow = false;
                 if let Some(i) = active {
-                    devs[i].gap = true;
+                    record_gap(&mut devs[i]);
                 }
                 if !preserve_failure {
                     status =
@@ -494,7 +502,7 @@ fn run() -> Result<(), String> {
                         baud_size_warning = false;
                         if let Some(i) = active.take() {
                             devs[i].joined = false;
-                            devs[i].gap = true;
+                            record_gap(&mut devs[i]);
                         }
                         if !preserve_failure {
                             status = "Daemon shutting down · cached screens retained".into();
@@ -502,13 +510,13 @@ fn run() -> Result<(), String> {
                     }
                     "event_gap" => {
                         if let Some(i) = active {
-                            devs[i].gap = true;
+                            record_gap(&mut devs[i]);
                         }
                         status = "Daemon event gap · state may be incomplete".into();
                     }
                     "settings_gap" => {
                         if let Some(i) = active {
-                            devs[i].gap = true;
+                            record_gap(&mut devs[i]);
                         }
                         status = "Settings gap · current state refreshed from status".into();
                     }
@@ -532,7 +540,7 @@ fn run() -> Result<(), String> {
                             }
                         }
                         "output_gap" if Some(idx) == active => {
-                            d.gap = true;
+                            record_gap(d);
                         }
                         "device" if ev["state"] == "disconnected" => {
                             if Some(idx) == active
@@ -547,7 +555,7 @@ fn run() -> Result<(), String> {
                             d.paste_mode_uncertain = false;
                             d.input_warning = None;
                             d.joined = false;
-                            d.gap = true;
+                            record_gap(d);
                             let mut leave_failed = false;
                             if Some(idx) == active {
                                 if let Err(error) = c.leave_device(d) {
@@ -589,7 +597,7 @@ fn run() -> Result<(), String> {
                             c.close();
                             daemon_lost = true;
                             subscription_failed = true;
-                            devs[i].gap = true;
+                            record_gap(&mut devs[i]);
                             active = None;
                             let failure = subscription_failure_status(&error);
                             operation_failure = Some(failure.clone());
@@ -603,8 +611,9 @@ fn run() -> Result<(), String> {
             }
             let (term_width, term_height) = crossterm::terminal::size().unwrap_or((80, 24));
             let narrow = term_width < 64;
+            let pane_visible = active.is_some() && focus_pane;
             let sidebar_width = if narrow {
-                if active.is_some() {
+                if pane_visible {
                     0
                 } else {
                     term_width.min(26)
@@ -612,11 +621,13 @@ fn run() -> Result<(), String> {
             } else {
                 28
             };
-            let gap_device = active.filter(|&i| devs[i].gap).or_else(|| {
+            let gap_device = if active.is_some() && focus_pane {
+                active.filter(|&i| devs[i].gap)
+            } else {
                 devs.get(selected)
-                    .is_some_and(|device| device.gap)
-                    .then_some(selected)
-            });
+                    .filter(|device| device.gap)
+                    .map(|_| selected)
+            };
             let gap_header_rows = term_height.saturating_sub(3).max(1);
             let warning_device = active.or(gap_device).or_else(|| {
                 (!devs.is_empty()).then_some(selected.min(devs.len().saturating_sub(1)))
@@ -783,7 +794,7 @@ fn run() -> Result<(), String> {
                 devs[i]
                     .screen
                     .screen_mut()
-                    .set_size(screen_rows, vt_screen_width(term_width));
+                    .set_size(screen_rows, vt_screen_width(term_width, pane_visible));
             }
             term.draw(|f| {
                 let size = f.area();
@@ -801,7 +812,9 @@ fn run() -> Result<(), String> {
                 let device_status = status_device
                     .map(|i| {
                         let marker = if devs[i].gap {
-                            "OUTPUT GAP"
+                            "OUTPUT GAP · a acknowledges"
+                        } else if devs[i].gap_acknowledged {
+                            "gap acknowledged; lost output not recovered"
                         } else if devs[i].new_output {
                             "NEW OUTPUT BELOW"
                         } else {
@@ -816,8 +829,14 @@ fn run() -> Result<(), String> {
                 let is_prompt = prompt_header.is_some();
                 let header = prompt_header.unwrap_or_else(|| {
                     format!(
-                        " serial-mcp · MCP clients: {count}    {}    {}",
-                        status, device_status
+                        " serial-mcp · MCP clients: {count} · {}    {}    {}",
+                        if focus_pane && active.is_some() {
+                            "focus:pane"
+                        } else {
+                            "focus:sidebar"
+                        },
+                        status,
+                        device_status
                     )
                 });
                 let header = Paragraph::new(header).wrap(Wrap { trim: true });
@@ -840,7 +859,7 @@ fn run() -> Result<(), String> {
                     .take(visible_devices)
                     .map(|(i, d)| {
                         ListItem::new(format!(
-                            "{}{} {}  {} · {} baud · control {}",
+                            "{}{} {}  {} · {} baud · control {}{}",
                             if Some(i) == active {
                                 "●"
                             } else if i == selected {
@@ -852,14 +871,19 @@ fn run() -> Result<(), String> {
                             d.port,
                             d.state,
                             d.baud,
-                            d.control
+                            d.control,
+                            if d.joined { " · joined" } else { "" }
                         ))
                     })
                     .collect();
                 f.render_widget(
                     List::new(items).block(
                         Block::default()
-                            .title(" Devices · Enter join · d Disconnect · q quit ")
+                            .title(if focus_pane && active.is_some() {
+                                " Devices · Ctrl-] focuses · a Ack gap · d Disconnect "
+                            } else {
+                                " Devices · FOCUS · Enter open · a Ack gap · d Disconnect · q quit "
+                            })
                             .borders(Borders::ALL),
                     ),
                     cols[0],
@@ -924,7 +948,11 @@ fn run() -> Result<(), String> {
                         Paragraph::new(lines).block(
                             Block::default()
                                 .title(if active.is_some() {
-                                    " Terminal · Esc Disconnect · Ctrl-B Change baud · Ctrl-End Bottom "
+                                    if focus_pane {
+                                        " Terminal · FOCUS · Ctrl-] sidebar · Ctrl-B baud · Ctrl-End bottom "
+                                    } else {
+                                        " Terminal · unfocused · Enter on the joined device to return "
+                                    }
                                 } else {
                                     " Serial terminal "
                                 })
@@ -969,11 +997,11 @@ fn run() -> Result<(), String> {
                         if let Some(i) = active {
                             devs[i].screen.screen_mut().set_size(
                                 rows.saturating_sub(4).max(1),
-                                vt_screen_width(cols),
+                                vt_screen_width(cols, pane_visible),
                             );
                         }
                     }
-                    Event::Key(k) if k.code == KeyCode::Char('q') && active.is_none() => break,
+                    Event::Key(k) if k.code == KeyCode::Char('q') && !(active.is_some() && focus_pane) => break,
                     Event::Key(k) if k.code==KeyCode::Char('r') && daemon_lost => {
                         match connect_or_start_daemon(){Ok(mut new_client)=>match new_client.req(json!({"op":"hello","role":"human","name":"rust-human-terminal","pid":std::process::id()})){Ok(h) if h["mcp_clients"].as_u64().is_some()=>{if let Some(i)=active.take(){devs[i].joined=false;devs[i].gap=true;}count=h["mcp_clients"].as_u64().unwrap_or(0).to_string();c=new_client;daemon_lost=false;leave_outcome_unknown=false;subscription_failed=false;operation_failure=None;status="Reconnected · select device explicitly".into();},_=>status="Daemon reconnect failed".into()},Err(_)=>status="Daemon reconnect failed".into()}
                     }
@@ -986,21 +1014,18 @@ fn run() -> Result<(), String> {
                             && !literal_next =>
                     {
                         baud_prompt=None;baud_prompt_target=None;baud_change_pending=false;baud_confirm=false;baud_size_warning=false;
-                        if let Some(i) = active.take() {
-                            match c.leave_device(&mut devs[i]) {
-                                Ok(()) => status = "Sidebar".into(),
-                                Err(error) => {
-                                    c.close();
-                                    daemon_lost = true;
-                                    leave_outcome_unknown = true;
-                                    devs[i].joined = false;
-                                    devs[i].gap = true;
-                                    let failure = leave_failure_status(&error);
-                                    operation_failure = Some(failure.clone());
-                                    status = failure;
-                                }
+                        literal_next = false;
+                        if let Some(i) = active {
+                            if focus_pane {
+                                focus_pane = false;
+                                selected = i;
+                                status = "Sidebar focus · Enter reopens pane · a acknowledges gap".into();
+                            } else {
+                                focus_pane = true;
+                                status = "Pane focus · Ctrl-] returns to sidebar".into();
                             }
                         } else {
+                            focus_pane = false;
                             status = "Sidebar".into();
                         }
                     }
@@ -1061,6 +1086,22 @@ fn run() -> Result<(), String> {
                                 };
                                 let changing=std::mem::take(&mut baud_change_pending);
                                 let raw = baud_prompt.take().unwrap();
+                                if !changing {
+                                    if let Some(previous) = active.filter(|&previous| previous != i) {
+                                        if let Err(error) = c.leave_device(&mut devs[previous]) {
+                                            c.close();
+                                            daemon_lost = true;
+                                            leave_outcome_unknown = true;
+                                            devs[previous].joined = false;
+                                            record_gap(&mut devs[previous]);
+                                            active = None;
+                                            let failure = leave_failure_status(&error);
+                                            operation_failure = Some(failure.clone());
+                                            status = failure;
+                                            continue;
+                                        }
+                                    }
+                                }
                                 match raw.parse::<u32>() {
                                     Ok(baud) if (1..=4_000_000).contains(&baud) => {
                                         if changing {
@@ -1078,7 +1119,7 @@ fn run() -> Result<(), String> {
                                                         c.close();
                                                         daemon_lost = true;
                                                         subscription_failed = true;
-                                                        devs[i].gap = true;
+                                                        record_gap(&mut devs[i]);
                                                         devs[i].joined = false;
                                                         let failure = subscription_failure_status(&error);
                                                         operation_failure = Some(failure.clone());
@@ -1086,11 +1127,12 @@ fn run() -> Result<(), String> {
                                                     } else {
                                                         devs[i].joined=true;
                                                         active=Some(i);
+                                                        focus_pane=true;
                                                         baud_size_warning=false;
                                                         leave_outcome_unknown=false;
                                                         subscription_failed=false;
                                                         literal_next=false;
-                                                        status="Connected · Ctrl-] leaves".into();
+                                                        status="Connected · Ctrl-] toggles focus".into();
                                                     }
                                                 },
                                                 Err(e) => status=format!("Join failed: {e}")
@@ -1106,20 +1148,36 @@ fn run() -> Result<(), String> {
                         }
                     }
                     Event::Key(_) if daemon_lost || leave_outcome_unknown || subscription_failed => {}
-                    Event::Key(k) if active.is_none() => match k.code {
+                    Event::Key(k) if !focus_pane || active.is_none() => match k.code {
                         KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
                         KeyCode::Down | KeyCode::Char('j') => { selected = (selected + 1).min(devs.len().saturating_sub(1)) }
+                        KeyCode::Char('a') if !devs.is_empty() => {
+                            let i = selected;
+                            if devs[i].gap {
+                                devs[i].gap = false;
+                                devs[i].gap_acknowledged = true;
+                                status = "Gap acknowledged · cached output kept · lost output is not recovered".into();
+                            } else {
+                                status = "No gap to acknowledge".into();
+                            }
+                        }
                         KeyCode::Char('d') if !devs.is_empty() => {
                             let i = selected;
-                            if devs[i].joined {
+                            if devs[i].joined || Some(i) == active {
                                 match c.leave_device(&mut devs[i]) {
-                                    Ok(()) => status = "Disconnected from selected device".into(),
+                                    Ok(()) => {
+                                        if Some(i) == active {
+                                            active = None;
+                                            focus_pane = false;
+                                        }
+                                        status = "Disconnected from selected device".into();
+                                    }
                                     Err(error) => {
                                         c.close();
                                         daemon_lost = true;
                                         leave_outcome_unknown = true;
                                         devs[i].joined = false;
-                                        devs[i].gap = true;
+                                        record_gap(&mut devs[i]);
                                         let failure = leave_failure_status(&error);
                                         operation_failure = Some(failure.clone());
                                         status = failure;
@@ -1131,14 +1189,35 @@ fn run() -> Result<(), String> {
                         }
                         KeyCode::Enter if !devs.is_empty() => {
                             let i = selected;
-                            if devs[i].state == "connected" {
+                            if devs[i].joined && Some(i) == active {
+                                focus_pane = true;
+                                literal_next = false;
+                                status = "Pane focus · Ctrl-] returns to sidebar".into();
+                            } else if devs[i].state == "connected" {
+                                let previous = active.filter(|&previous| previous != i);
+                                let leave_error = previous.and_then(|previous| {
+                                    c.leave_device(&mut devs[previous]).err()
+                                });
+                                if let Some(error) = leave_error {
+                                    c.close();
+                                    daemon_lost = true;
+                                    leave_outcome_unknown = true;
+                                    let previous_device = previous.unwrap_or(i);
+                                    devs[previous_device].joined = false;
+                                    record_gap(&mut devs[previous_device]);
+                                    active = None;
+                                    let failure = leave_failure_status(&error);
+                                    operation_failure = Some(failure.clone());
+                                    status = failure;
+                                    continue;
+                                }
                                 match c.req(json!({"op":"join","port":devs[i].port})) {
                                     Ok(joined) => {
                                         if let Err(error) = c.subscribe_device(&devs[i]) {
                                             c.close();
                                             daemon_lost = true;
                                             subscription_failed = true;
-                                            devs[i].gap = true;
+                                            record_gap(&mut devs[i]);
                                             devs[i].joined = false;
                                             let failure = subscription_failure_status(&error);
                                             operation_failure = Some(failure.clone());
@@ -1147,12 +1226,13 @@ fn run() -> Result<(), String> {
                                             devs[i].device_id=joined["device_id"].as_str().map(str::to_owned);
                                             devs[i].joined = true;
                                             active = Some(i);
+                                            focus_pane = true;
                                             baud_size_warning = false;
                                             leave_outcome_unknown = false;
                                             subscription_failed = false;
                                             operation_failure = None;
                                             literal_next = false;
-                                            status = "Connected · Ctrl-] leaves".into();
+                                            status = "Connected · Ctrl-] toggles focus".into();
                                         }
                                     }
                                     Err(e) => status = format!("Join failed: {e}"),
@@ -1174,6 +1254,7 @@ fn run() -> Result<(), String> {
                     },
                     Event::Key(k)
                         if active.is_some()
+                            && focus_pane
                             && matches!(
                                 route_pane_key(k, literal_next, false),
                                 PaneKeyRoute::ScrollToBottom
@@ -1183,7 +1264,9 @@ fn run() -> Result<(), String> {
                             devs[i].new_output = false;
                         }
                     }
-                    Event::Key(k) if active.is_some() && k.code == KeyCode::Esc && !literal_next => {
+                    Event::Key(k)
+                        if active.is_some() && focus_pane && k.code == KeyCode::Esc && !literal_next =>
+                    {
                         if let Some(i) = active.take() {
                             match c.leave_device(&mut devs[i]) {
                                 Ok(()) => status = "Sidebar".into(),
@@ -1192,7 +1275,7 @@ fn run() -> Result<(), String> {
                                     daemon_lost = true;
                                     leave_outcome_unknown = true;
                                     devs[i].joined = false;
-                                    devs[i].gap = true;
+                                    record_gap(&mut devs[i]);
                                     let failure = leave_failure_status(&error);
                                     operation_failure = Some(failure.clone());
                                     status = failure;
@@ -1202,7 +1285,7 @@ fn run() -> Result<(), String> {
                         baud_size_warning = false;
                         literal_next = false;
                     }
-                    Event::Key(k) if active.is_some() && !literal_next && (k.code==KeyCode::Char('b') || k.code==KeyCode::Char('B')) && k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Event::Key(k) if active.is_some() && focus_pane && !literal_next && (k.code==KeyCode::Char('b') || k.code==KeyCode::Char('B')) && k.modifiers.contains(KeyModifiers::CONTROL) => {
                         let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
                         if baud_dialog_supported(width, height) {
                             baud_size_warning = false;
@@ -1214,7 +1297,7 @@ fn run() -> Result<(), String> {
                         }
                     }
                     Event::Key(k) => {
-                        if let Some(i) = active {
+                        if let Some(i) = active.filter(|_| focus_pane) {
                             let route = route_pane_key(
                                 k,
                                 literal_next,
@@ -1249,7 +1332,7 @@ fn run() -> Result<(), String> {
                         }
                     }
                     Event::Paste(_) if baud_confirm || baud_prompt.is_some() => {}
-                    Event::Paste(text) if active.is_some() => {
+                    Event::Paste(text) if active.is_some() && focus_pane => {
                         if let Some(i) = active {
                             let bracketed = devs[i].screen.screen().bracketed_paste();
                             let mut failed = false;
@@ -1355,7 +1438,7 @@ fn run() -> Result<(), String> {
                         }
                     }
                     Event::Mouse(_) if baud_confirm || baud_prompt.is_some() => {}
-                    Event::Mouse(m) if active.is_some() && pane_height > 0 && m.column>=sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) && !m.modifiers.contains(KeyModifiers::SHIFT) && active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()!=vt100::MouseProtocolMode::None) => {
+                    Event::Mouse(m) if active.is_some() && focus_pane && pane_height > 0 && m.column>=sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) && !m.modifiers.contains(KeyModifiers::SHIFT) && active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()!=vt100::MouseProtocolMode::None) => {
                         if let Some(i)=active {
                             let screen=devs[i].screen.screen();
                             let col=m.column.saturating_sub(sidebar_width).max(1);
@@ -1369,10 +1452,10 @@ fn run() -> Result<(), String> {
                             }
                         }
                     }
-                    Event::Mouse(m) if active.is_some() && pane_height > 0 && (m.modifiers.contains(KeyModifiers::SHIFT) || active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()==vt100::MouseProtocolMode::None)) && m.kind==MouseEventKind::Down(crossterm::event::MouseButton::Left) && m.column>=sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) => {
+                    Event::Mouse(m) if active.is_some() && focus_pane && pane_height > 0 && (m.modifiers.contains(KeyModifiers::SHIFT) || active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()==vt100::MouseProtocolMode::None)) && m.kind==MouseEventKind::Down(crossterm::event::MouseButton::Left) && m.column>=sidebar_width && m.row>=pane_content_top && m.row<term_height.saturating_sub(1) => {
                         if let Some(i)=active { let pos=(m.row.saturating_sub(pane_content_top).saturating_add(screen_row_offset),m.column.saturating_sub(sidebar_width+1)); devs[i].selection=Some((pos,pos)); devs[i].selecting=true; }
                     }
-                    Event::Mouse(m) if active.is_some() && pane_height > 0 && (m.modifiers.contains(KeyModifiers::SHIFT) || active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()==vt100::MouseProtocolMode::None)) && m.kind==MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                    Event::Mouse(m) if active.is_some() && focus_pane && pane_height > 0 && (m.modifiers.contains(KeyModifiers::SHIFT) || active.is_some_and(|i|devs[i].screen.screen().mouse_protocol_mode()==vt100::MouseProtocolMode::None)) && m.kind==MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                         if let Some(i)=active { if devs[i].selecting { if let Some((start,_))=devs[i].selection {let pos=(m.row.saturating_sub(pane_content_top).saturating_add(screen_row_offset),m.column.saturating_sub(sidebar_width+1));devs[i].selection=Some((start,pos));} } }
                     }
                     Event::Mouse(m) if active.is_some() && m.kind==MouseEventKind::Up(crossterm::event::MouseButton::Left) => {if let Some(i)=active{devs[i].selecting=false;}}
@@ -1407,30 +1490,11 @@ fn run() -> Result<(), String> {
                         if let Some(target) = target.filter(|_| {
                             m.column < sidebar_width && m.row < term_height.saturating_sub(1)
                         }) {
-                            let leave_error = if let Some(i) = active.take() {
-                                match c.leave_device(&mut devs[i]) {
-                                    Ok(()) => None,
-                                    Err(error) => {
-                                        c.close();
-                                        daemon_lost = true;
-                                        leave_outcome_unknown = true;
-                                        devs[i].joined = false;
-                                        devs[i].gap = true;
-                                        let failure = leave_failure_status(&error);
-                                        operation_failure = Some(failure);
-                                        Some(error)
-                                    }
-                                }
-                            } else {
-                                None
-                            };
                             selected = target;
+                            focus_pane = false;
                             literal_next = false;
                             baud_size_warning = false;
-                            status = leave_error.map_or_else(
-                                || "Device selected · Enter joins".into(),
-                                |error| leave_failure_status(&error),
-                            );
+                            status = "Device selected · Enter joins".into();
                         }
                     }
                     _ => {}
@@ -2583,8 +2647,16 @@ fn baud_dialog_supported(width: u16, height: u16) -> bool {
     width >= 16 && height >= 5
 }
 
-fn vt_screen_width(term_width: u16) -> u16 {
-    let sidebar_width = if term_width < 64 { 0 } else { 28 };
+fn vt_screen_width(term_width: u16, pane_visible: bool) -> u16 {
+    let sidebar_width = if term_width < 64 {
+        if pane_visible {
+            0
+        } else {
+            term_width.min(26)
+        }
+    } else {
+        28
+    };
     term_width
         .saturating_sub(sidebar_width)
         .saturating_sub(2)
@@ -2762,6 +2834,52 @@ mod tests {
         let mut device = Device::new(port);
         device.screen.screen_mut().set_size(20, 80);
         device
+    }
+
+    #[test]
+    fn genuine_gaps_require_an_explicit_acknowledgement() {
+        let mut device = test_device("synthetic-device".into());
+        assert!(!device.gap);
+        record_gap(&mut device);
+        assert!(device.gap);
+        assert!(!device.gap_acknowledged);
+        // A later genuine gap invalidates an earlier acknowledgement.
+        device.gap = false;
+        device.gap_acknowledged = true;
+        record_gap(&mut device);
+        assert!(device.gap);
+        assert!(!device.gap_acknowledged);
+    }
+
+    #[test]
+    fn leaving_marks_a_gap_only_when_membership_was_really_released() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let reader = BufReader::new(stream.try_clone().unwrap());
+        let mut client = Client {
+            stream,
+            reader,
+            id: 0,
+            events: VecDeque::new(),
+            overflow: false,
+        };
+        let server = std::thread::spawn(move || {
+            let mut peer_reader = BufReader::new(peer.try_clone().unwrap());
+            for expected_id in 1..=2 {
+                let mut line = String::new();
+                peer_reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["id"], expected_id);
+                let response = json!({"v": V, "id": expected_id, "ok": true, "result": {}});
+                peer.write_all(format!("{response}\n").as_bytes()).unwrap();
+            }
+        });
+        let mut device = test_device("synthetic-device".into());
+        device.joined = true;
+        client.leave_device(&mut device).unwrap();
+        assert!(!device.joined);
+        assert!(device.gap);
+        client.close();
+        server.join().unwrap();
     }
 
     #[test]
@@ -3322,8 +3440,9 @@ mod tests {
         );
         assert!(baud_dialog_supported(16, 5));
         assert!(!baud_dialog_supported(10, 1));
-        assert_eq!(vt_screen_width(50), 48);
-        assert_eq!(vt_screen_width(100), 70);
+        assert_eq!(vt_screen_width(50, true), 48);
+        assert_eq!(vt_screen_width(50, false), 22);
+        assert_eq!(vt_screen_width(100, true), 70);
         let mut digits = String::new();
         for digit in "0000000".chars() {
             assert!(push_baud_digit(&mut digits, digit));
