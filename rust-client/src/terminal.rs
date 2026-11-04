@@ -36,8 +36,97 @@ const MAX: usize = 4 * 1024 * 1024;
 const SCROLLBACK: usize = 2000;
 const MAX_DEVICE_TABS: usize = 16;
 static STOP: AtomicBool = AtomicBool::new(false);
+/// Set once the TUI thread finished its own teardown, so the watchdog below
+/// does not force an exit that is already happening.
+static TUI_FINISHED: AtomicBool = AtomicBool::new(false);
+/// How long a stop request may take to end the TUI before it is forced.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+const TTY_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 extern "C" fn stop_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
+}
+
+/// The fd crossterm reads events from: stdin when it is a tty, else /dev/tty.
+fn tty_probe_fd() -> Option<libc::c_int> {
+    use std::os::unix::io::AsRawFd;
+    static DEV_TTY: std::sync::OnceLock<Option<fs::File>> = std::sync::OnceLock::new();
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        return Some(libc::STDIN_FILENO);
+    }
+    DEV_TTY
+        .get_or_init(|| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .ok()
+        })
+        .as_ref()
+        .map(AsRawFd::as_raw_fd)
+}
+
+/// True when the terminal this TUI draws on is gone (window closed, pty hung up).
+///
+/// The hangup is observable only through `tcgetattr`: reads on such a tty return
+/// end-of-file, and crossterm 0.29 answers a readable-but-empty tty by re-reading
+/// it without bound, so an event poll that sees a closed window never returns.
+fn tty_hung_up() -> bool {
+    let Some(fd) = tty_probe_fd() else {
+        return true;
+    };
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } == 0 {
+        return false;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    matches!(errno, libc::EIO | libc::ENXIO | libc::ENODEV | libc::ENOTTY)
+}
+
+/// Put the terminal back into a usable state without ever blocking, then exit.
+fn force_exit() -> ! {
+    // A hung-up tty accepts neither writes nor blocking calls, and a frozen
+    // emulator could block a write forever: never wait on it while leaving.
+    unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, libc::O_NONBLOCK) };
+    let _ = disable_raw_mode();
+    let mut out = std::io::stdout();
+    let _ = execute!(
+        out,
+        crossterm::event::DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
+    let _ = out.flush();
+    unsafe { libc::_exit(0) }
+}
+
+/// End the process when the TUI thread cannot, because an event poll is wedged
+/// on a hung-up tty or because a stop request did not finish in time.
+fn spawn_tty_watchdog() {
+    let spawned = std::thread::Builder::new()
+        .name("tty-watchdog".into())
+        .spawn(|| {
+            let mut stopping: Option<Instant> = None;
+            loop {
+                std::thread::sleep(TTY_WATCH_INTERVAL);
+                if TUI_FINISHED.load(Ordering::SeqCst) {
+                    return;
+                }
+                if tty_hung_up() {
+                    force_exit();
+                }
+                if STOP.load(Ordering::SeqCst) {
+                    let since = *stopping.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= STOP_GRACE {
+                        force_exit();
+                    }
+                } else {
+                    stopping = None;
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("serial-mcp-terminal: tty watchdog unavailable: {error}");
+    }
 }
 
 struct Client {
@@ -441,10 +530,16 @@ fn run() -> Result<(), String> {
         let _ = disable_raw_mode();
         return Err(e.to_string());
     }
+    spawn_tty_watchdog();
     let mut result = (|| -> Result<(), String> {
         let mut term = Terminal::new(CrosstermBackend::new(out)).map_err(|e| e.to_string())?;
         loop {
             if STOP.load(Ordering::SeqCst) {
+                break;
+            }
+            // A closed window makes crossterm's poll spin on a dead tty forever,
+            // so leave before entering it instead of losing the exit path.
+            if tty_hung_up() {
                 break;
             }
             if let Some(i) = active {
@@ -1571,6 +1666,7 @@ fn run() -> Result<(), String> {
     );
     let _ = disable_raw_mode();
     let _ = c.req(json!({"op":"bye"}));
+    TUI_FINISHED.store(true, Ordering::SeqCst);
     result
 }
 fn add_device(

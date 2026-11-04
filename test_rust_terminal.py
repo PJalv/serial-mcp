@@ -220,6 +220,53 @@ def _read_raw_until(fd, buf, needle, timeout=5, start=0):
     assert needle in buf[start:], repr(buf[-2000:])
 
 
+def test_rust_terminal_exits_when_its_own_terminal_window_disappears(tmp_path,terminal_binary):
+    """Closing the TUI's tty must end the process instead of wedging it.
+
+    crossterm 0.29 answers a readable-but-hung-up tty by re-reading it without
+    bound, so the TUI thread never regains control to notice the hangup or the
+    stop signal. A closed window must still end the process, and the daemon must
+    see its last client leave.
+    """
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    daemon = serial_mcp_daemon.DaemonServer(
+        runtime, state=serial_mcp_engine.SerialState(log_path=str(tmp_path / "daemon.log"))
+    )
+    daemon.start()
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+    proc = subprocess.Popen(
+        [str(terminal_binary)], stdin=slave, stdout=slave, stderr=slave,
+        env=dict(os.environ, SERIAL_MCP_RUNTIME_DIR=str(runtime)),
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        _read_until(master, output, b"MCPclients:")
+        assert daemon.status()["clients"] == 1
+        os.close(master)  # the window closes: the tty hangs up
+        master = None
+        proc.wait(timeout=5)  # a spinning poll would never return
+        assert proc.returncode == 0, output[-2000:]
+        deadline = time.monotonic() + 5
+        while daemon.status()["clients"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert daemon.status()["clients"] == 0
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                # A wedged event poll ignores SIGTERM, so never leak the process.
+                proc.kill()
+                proc.wait(timeout=5)
+        daemon.stop("test complete")
+        if master is not None:
+            os.close(master)
+
+
 def test_rust_terminal_counts_mcp_and_quits_cleanly_in_isolated_daemon(tmp_path,terminal_binary):
     runtime = tmp_path / "runtime"
     runtime.mkdir(mode=0o700)
